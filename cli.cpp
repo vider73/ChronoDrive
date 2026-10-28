@@ -34,8 +34,10 @@ int wmain(int argc, wchar_t** argv) {
       Sleep(2000); std::string st; json p = Miniserver::LinkPoll(url, r.value("code", ""), r.value("secret", ""), st, err);
       if (st == "pending") continue;
       if (st != "approved") { out("pairing " + st + ": " + err); return 1; }
-      cfg.url = url; cfg.email = p.value("email", ""); cfg.device_id = p.value("device_id", ""); cfg.device_name = name;
-      sec.Set("device_secret", p.value("device_secret", "")); sec.Save(); SaveConfig(cfg);
+      cfg.url = url; cfg.email = p.value("record", json::object()).value("email", ""); cfg.device_id = p.value("device_id", ""); cfg.device_name = name;
+      sec.Set("device_secret", p.value("device_secret", "")); sec.Save();
+      if (cfg.email.empty()) { Miniserver m2(cfg.url, cfg.standby, cfg.device_id, sec.Get("device_secret")); std::string e2; json me = m2.Json(L"POST", "/api/collections/users/auth-refresh", json::object(), e2); if (me.is_object()) cfg.email = me.value("record", json::object()).value("email", ""); }   // PocketBase hides the email in the pairing answer
+      SaveConfig(cfg);
       out("Linked to " + cfg.email + " (device " + cfg.device_id + ")"); return 0;
     }
     out("pairing timed out"); return 1;

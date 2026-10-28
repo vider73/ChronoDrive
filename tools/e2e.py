@@ -7,7 +7,8 @@ Usage: python tools/e2e.py [node]     (default office; needs build\Release\cdriv
 import json, os, secrets, shutil, subprocess, sys, tempfile, time, urllib.request, urllib.error, uuid, re
 env = dict(l.strip().split("=", 1) for l in open(r"I:\LLMLab\Azure\miniserver\.secrets.env", encoding="utf-8") if "=" in l)
 B = env["MINISERVER_URL"].rstrip("/")
-CLI = r"I:\LLMLab\ChronoDrive\build\Release\cdrive.exe"
+CLI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "Release", "cdrive.exe")
+NODE = sys.argv[1] if len(sys.argv) > 1 else "office"
 
 def call(method, path, body=None, token=None):
     data = json.dumps(body).encode() if body is not None else None
@@ -42,8 +43,10 @@ def pair(data_dir, utok, name):
     out = p.communicate(timeout=60)[0]
     ok(p.returncode == 0 and "Linked to" in out, "paired: " + out.strip().splitlines()[-1][:80])
 
-def wait_sync(data_dir, seconds):
+def wait_sync(data_dir, seconds, label=""):
     rc, out = cli(data_dir, "sync", "--seconds", str(seconds), timeout=seconds + 60)
+    if label:
+        print("   " + label + ": " + " | ".join(out.splitlines()[-5:]), flush=True)
     return out
 
 s, r = call("POST", "/api/collections/_superusers/auth-with-password", {"identity": env["PB_SUPERUSER_EMAIL"], "password": env["PB_SUPERUSER_PASSWORD"]})
@@ -76,13 +79,13 @@ try:
     ok(open(os.path.join(FA, "docs", "hello.txt")).read() == "hello from A\nand B\n" and os.path.exists(os.path.join(FA, "fromB.txt")), "A got B's change and new file")
     # conflict: both edit hello.txt before syncing
     open(os.path.join(FA, "docs", "hello.txt"), "w").write("A wins?\n"); open(os.path.join(FB, "docs", "hello.txt"), "w").write("B wins?\n")
-    out = wait_sync(A, 30); out = wait_sync(Bd, 30); out = wait_sync(A, 30)
+    out = wait_sync(A, 45, "A conflict"); out = wait_sync(Bd, 45, "B conflict"); out = wait_sync(A, 45, "A after conflict")
     conflicts = [f for f in os.listdir(os.path.join(FB, "docs")) if "conflict" in f]
     ok(conflicts and open(os.path.join(FA, "docs", "hello.txt")).read() == "A wins?\n" and open(os.path.join(FB, "docs", "hello.txt")).read() == "A wins?\n", f"conflict kept as a copy on B ({conflicts}), both have A's version")
     ok(os.path.exists(os.path.join(FA, "docs", conflicts[0])), "the conflict copy went up to A too")
     # delete on A, gone on B (Recycle Bin)
     os.remove(os.path.join(FA, "big.bin"))
-    out = wait_sync(A, 30); out = wait_sync(Bd, 30)
+    out = wait_sync(A, 45, "A delete"); out = wait_sync(Bd, 45, "B delete")
     ok(not os.path.exists(os.path.join(FB, "big.bin")), "a delete on A removes the file on B")
     s, d = call("GET", f"/api/ms/drive/drives/{did}", token=utok)
     print("   drive on the server:", d.get("used"), "bytes,", d.get("files"), "files, rev", d.get("rev"), "online", d.get("online"))

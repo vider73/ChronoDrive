@@ -292,8 +292,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
           if (st == "pending") return;
           linkCode.clear();
           if (st != "approved") { accountLbl->Text(W("Pairing " + st + ": " + err)); pairBtn->Enabled(true); repaint(); return; }
-          cfg.url = linkUrl; cfg.email = p.value("email", ""); cfg.device_id = p.value("device_id", ""); cfg.device_name = cd::ComputerName();
+          cfg.url = linkUrl; cfg.email = p.value("record", json::object()).value("email", ""); cfg.device_id = p.value("device_id", ""); cfg.device_name = cd::ComputerName();
           sec.Set("device_secret", p.value("device_secret", "")); sec.Save(); cd::SaveConfig(cfg);
+          if (cfg.email.empty()) { cd::Config c = cfg; std::string secret = sec.Get("device_secret"); Async([c, secret](std::string& err) { cd::Miniserver ms(c.url, c.standby, c.device_id, secret); return ms.Json(L"POST", "/api/collections/users/auth-refresh", json::object(), err); }, [&](const json& me, const std::string&) { if (me.is_object()) { cfg.email = me.value("record", json::object()).value("email", ""); cd::SaveConfig(cfg); fillAccount(); repaint(); } }); }
           fillAccount(); loadDrives(); repaint();
         });
       }
