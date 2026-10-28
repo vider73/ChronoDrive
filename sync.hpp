@@ -127,6 +127,10 @@ class Engine {
       json g = ms.Json(L"POST", "/api/ms/drive/drives/" + m_cfg.drive_id + "/grant", json({{"device", m_pc}}), err);
       if (g.is_null()) { if (err.find("http 403") != std::string::npos || err.find("http 404") != std::string::npos || err == "revoked") { SetState("error", err == "revoked" ? "This PC was unlinked on the Miniserver: pair it again." : "The drive is disabled or gone: " + err); return false; } SetState("offline", "Miniserver: " + err); return false; }
       m_dc.grant = g.value("grant", ""); m_grantExp = g.value("exp", (int64_t)0); m_urls = g.value("urls", json::array()); m_certSha = g.value("cert_sha256", ""); m_lastUrlCheck = Now();
+      // CHRONODRIVE_NODE_URL=https://host:port replaces the node's address (a home node over the user's own VPN,
+      // tests from another network); the pinned certificate still has to match, so it is not a way around it
+      std::string over = Utf8(EnvW(L"CHRONODRIVE_NODE_URL"));
+      if (!over.empty()) { while (!over.empty() && over.back() == '/') over.pop_back(); m_urls = json::array({{{"url", over + "/drive/" + m_cfg.drive_id}, {"lan", !m_certSha.empty()}, {"nearby", false}}}); }
     }
     // the first url that answers: a LAN address needs the node's pinned certificate, a public one the normal chain
     for (auto& u : m_urls) {

@@ -1,5 +1,5 @@
 // cli.cpp — cdrive.exe: the console twin of ChronoDrive (the same engine, no window). For scripts and for testing.
-//   cdrive pair [--url <miniserver>] [--name <device name>]     pair this PC (prints the code, opens the QR page, waits)
+//   cdrive pair [--url <miniserver>] [--name <device name>] [--no-browser]   pair this PC (prints the code, opens the QR page, waits)
 //   cdrive unlink                                              forget the account on this PC
 //   cdrive drives                                              the account's drives and where a new one may go
 //   cdrive create --name <n> --node <node> --size <GB> [--backup] [--mirror <node>]
@@ -22,14 +22,14 @@ int wmain(int argc, wchar_t** argv) {
   SetConsoleOutputCP(CP_UTF8);
   std::string cmd = argc > 1 ? Utf8(argv[1]) : "status";
   Config cfg = LoadConfig(); Secrets sec; sec.Load();
-  auto out = [](const std::string& s) { std::cout << s << "\n"; };
+  auto out = [](const std::string& s) { std::cout << s << std::endl; };   // flushed: a script reads the pairing code from a pipe
   if (cmd == "pair") {
     std::string url = Arg(argc, argv, L"--url", cfg.url), name = Arg(argc, argv, L"--name", ComputerName()), err;
     while (!url.empty() && url.back() == '/') url.pop_back();
     json r = Miniserver::LinkStart(url, name, err);
     if (r.is_null()) { out("cannot start pairing: " + err); return 1; }
     out("Pairing code " + r.value("code", "") + "  (approve it at " + r.value("link_url", "") + ")");
-    ShellExecuteW(nullptr, L"open", Wide(r.value("qr_page", "")).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if (!Flag(argc, argv, L"--no-browser")) ShellExecuteW(nullptr, L"open", Wide(r.value("qr_page", "")).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     for (int i = 0; i < 150; ++i) {
       Sleep(2000); std::string st; json p = Miniserver::LinkPoll(url, r.value("code", ""), r.value("secret", ""), st, err);
       if (st == "pending") continue;

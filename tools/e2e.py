@@ -1,6 +1,7 @@
 """End-to-end test of ChronoDrive against a real node: a throwaway user, two "PCs" (two data dirs, two devices paired
 through the real pairing flow and approved with the user's token), one drive on a node with the drive role, cdrive
 sync on both with files going both ways, a conflict, a delete. Everything is removed at the end.
+CHRONODRIVE_NODE_URL=https://host:port reaches a home node over Tailscale instead of its LAN address.
 
 Usage: python tools/e2e.py [node]     (default office; needs build\Release\cdrive.exe and the Miniserver repo's .secrets.env)"""
 import json, os, secrets, shutil, subprocess, sys, tempfile, time, urllib.request, urllib.error, uuid, re
@@ -32,7 +33,7 @@ def cli(data_dir, *args, timeout=120):
 
 def pair(data_dir, utok, name):
     e = dict(os.environ, CHRONODRIVE_DATA=data_dir, MINISERVER_URL=B)
-    p = subprocess.Popen([CLI, "pair", "--name", name], env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+    p = subprocess.Popen([CLI, "pair", "--name", name, "--no-browser"], env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
     line = p.stdout.readline()
     m = re.search(r"Pairing code ([A-Z0-9-]+)", line)
     ok(m is not None, "pair started: " + line.strip()[:80])
