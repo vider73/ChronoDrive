@@ -1,0 +1,4 @@
+#pragma once
+#define CD_VERSION_STR "@CD_VERSION@"
+#define CD_VERSION_WSTR L"@CD_VERSION@"
+#define CD_VERSION_RC @CD_VER_MAJOR@,@CD_VER_MINOR@,@CD_VER_PATCH@,0
