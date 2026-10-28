@@ -24,9 +24,10 @@ struct Index {
   bool Load() {
     std::string s; if (!ReadTextFile(IndexPath(), s)) return false;
     try { json j = json::parse(s); rev = j.value("rev", (int64_t)0);
-      for (auto& el : j.value("files", json::object()).items()) { IndexEntry e; auto& v = el.value(); e.dir = v.value("dir", false); e.size = v.value("size", (uint64_t)0); e.mtime = v.value("mtime", (int64_t)0); e.sha256 = v.value("sha256", ""); e.rev = v.value("rev", (int64_t)0); files[el.key()] = e; }
-      for (auto& el : j.value("uploads", json::object()).items()) uploads[el.key()] = el.value().get<std::string>();
-    } catch (...) { files.clear(); rev = 0; return false; }
+      json files_ = j.value("files", json::object()), ups_ = j.value("uploads", json::object());   // named: items() over a temporary dangles
+      for (auto& el : files_.items()) { IndexEntry e; auto& v = el.value(); e.dir = v.value("dir", false); e.size = v.value("size", (uint64_t)0); e.mtime = v.value("mtime", (int64_t)0); e.sha256 = v.value("sha256", ""); e.rev = v.value("rev", (int64_t)0); files[el.key()] = e; }
+      for (auto& el : ups_.items()) uploads[el.key()] = el.value().get<std::string>();
+    } catch (std::exception& e) { Log(std::string("index.json cannot be read, starting fresh: ") + e.what()); files.clear(); rev = 0; return false; }
     return true;
   }
   bool Save() const {
@@ -151,6 +152,7 @@ class Engine {
       json r = m_dc.Changes(m_idx.rev, 0, err);
       if (r.is_null()) return false;
       std::vector<Entry> list; for (auto& c : r.value("changes", json::array())) list.push_back(EntryOf(c));
+      if (!list.empty()) Log("changes since " + std::to_string(m_idx.rev) + ": " + std::to_string(list.size()) + " (up to rev " + std::to_string(list.back().rev) + ")");
       if (list.empty()) { m_idx.rev = (std::max)(m_idx.rev, r.value("rev", m_idx.rev)); return true; }
       Progress((int)list.size(), 0, 0);
       for (auto& e : list) { if (!m_run) return false; Apply(e); m_idx.rev = (std::max)(m_idx.rev, e.rev); }
@@ -321,7 +323,8 @@ class Engine {
   void Loop() {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     m_root = m_cfg.folder; m_pc = ComputerName();
-    m_idx.Load();
+    bool loaded = m_idx.Load();
+    Log("index " + std::string(loaded ? "loaded" : "not loaded (fresh start)") + ": rev " + std::to_string(m_idx.rev) + ", " + std::to_string(m_idx.files.size()) + " entries");
     if (m_cfg.drive_id.empty() || m_root.empty() || m_cfg.device_id.empty()) { SetState("setup", "Pair this PC and pick a drive and a folder."); return; }
     EnsureDir(m_root);
     m_watcher = std::thread([this] { Watch(); });

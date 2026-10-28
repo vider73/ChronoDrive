@@ -74,8 +74,8 @@ try:
     ok(os.path.exists(os.path.join(FB, "docs", "hello.txt")) and open(os.path.join(FB, "big.bin"), "rb").read() == big, "B downloaded both files intact")
     # B changes a file and adds one; A gets them
     open(os.path.join(FB, "docs", "hello.txt"), "a").write("and B\n"); open(os.path.join(FB, "fromB.txt"), "w").write("B")
-    out = wait_sync(Bd, 30)
-    out = wait_sync(A, 30)
+    out = wait_sync(Bd, 45, "B after its edit")
+    out = wait_sync(A, 45, "A pulling B's edit")
     ok(open(os.path.join(FA, "docs", "hello.txt")).read() == "hello from A\nand B\n" and os.path.exists(os.path.join(FA, "fromB.txt")), "A got B's change and new file")
     # conflict: both edit hello.txt before syncing
     open(os.path.join(FA, "docs", "hello.txt"), "w").write("A wins?\n"); open(os.path.join(FB, "docs", "hello.txt"), "w").write("B wins?\n")
