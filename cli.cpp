@@ -3,11 +3,12 @@
 //   cdrive unlink                                              forget the account on this PC
 //   cdrive drives                                              the account's drives and where a new one may go
 //   cdrive create --name <n> --node <node> --size <GB> [--backup] [--mirror <node>]
-//   cdrive use <drive id> --folder <path>                      which drive this PC syncs, and into which folder
-//   cdrive sync [--seconds <n>]                                run the engine (until Ctrl+C, or n seconds), status every 2 s
+//   cdrive use <drive id> (--letter Z | --folder <path>)       show a drive on this PC as a drive letter or in a folder
+//   cdrive remove <drive id>                                   take it off this PC (the files stay)
+//   cdrive sync [--seconds <n>]                                sync every drive shown here (until Ctrl+C, or n seconds)
 //   cdrive status                                              the configuration and the index summary
 //   cdrive log [n]                                             the last n lines of the log
-#include "sync.hpp"
+#include "drives.hpp"
 #include <shellapi.h>
 #include <iostream>
 #include "version.h"
@@ -42,14 +43,17 @@ int wmain(int argc, wchar_t** argv) {
     }
     out("pairing timed out"); return 1;
   }
-  if (cmd == "unlink") { Secrets s; s.Clear(); s.Save(); cfg.email.clear(); cfg.device_id.clear(); cfg.drive_id.clear(); SaveConfig(cfg); DeleteFileW(IndexPath().c_str()); out("unlinked"); return 0; }
+  if (cmd == "unlink") { { DriveSet set(cfg, ""); std::vector<std::string> ids; for (auto& m : cfg.maps) ids.push_back(m.id); for (auto& id : ids) set.Remove(id); } Secrets s; s.Clear(); s.Save(); cfg.email.clear(); cfg.device_id.clear(); SaveConfig(cfg); out("unlinked"); return 0; }
   if (cmd == "log") { for (auto& l : LogTail(argc > 2 ? (size_t)_wtoi(argv[2]) : 40)) out(l); return 0; }
   if (cmd == "status") {
     out("server     " + cfg.url + (cfg.standby.empty() ? "" : "  standby " + cfg.standby));
     out("account    " + (cfg.email.empty() ? std::string("(not paired)") : cfg.email + "  device " + cfg.device_id));
-    out("drive      " + (cfg.drive_id.empty() ? std::string("(none)") : cfg.drive_name + " [" + cfg.drive_id + "] on " + cfg.drive_node + " (" + cfg.drive_node_kind + ")"));
-    out("folder     " + Utf8(cfg.folder) + (cfg.paused ? "  (paused)" : ""));
-    Index idx; if (idx.Load()) { size_t files = 0; uint64_t bytes = 0; for (auto& [p, e] : idx.files) if (!e.dir) { ++files; bytes += e.size; } out("index      rev " + std::to_string(idx.rev) + ", " + std::to_string(files) + " files, " + Human(bytes) + (idx.uploads.empty() ? "" : ", " + std::to_string(idx.uploads.size()) + " upload(s) to resume")); }
+    if (cfg.maps.empty()) out("drives     (none shown on this PC)");
+    for (auto& m : cfg.maps) {
+      Index idx; idx.path = IndexPathFor(m.id); size_t files = 0; uint64_t bytes = 0; bool ok = idx.Load(); for (auto& [p, e] : idx.files) if (!e.dir) { ++files; bytes += e.size; }
+      out("drive      " + m.name + " [" + m.id + "] on " + m.node + "  ->  " + Utf8(ShownAt(m)) + (m.mode == "letter" ? "  (files in " + Utf8(m.folder) + ")" : "") + (m.paused ? "  paused" : "")
+          + (ok ? "  | rev " + std::to_string(idx.rev) + ", " + std::to_string(files) + " files, " + Human(bytes) : ""));
+    }
     return 0;
   }
   Miniserver ms(cfg.url, cfg.standby, cfg.device_id, sec.Get("device_secret"));
@@ -70,30 +74,45 @@ int wmain(int argc, wchar_t** argv) {
     out("created " + d.value("id", "") + "  " + d.value("name", "") + " on " + d.value("node", "")); return 0;
   }
   if (cmd == "use" && argc > 2) {
-    std::string id = Utf8(argv[2]), folder = Arg(argc, argv, L"--folder"), err;
+    std::string id = Utf8(argv[2]), folder = Arg(argc, argv, L"--folder"), letter = Arg(argc, argv, L"--letter"), err;
     json d = ms.Json(L"GET", "/api/ms/drive/drives/" + id, nullptr, err);
     if (d.is_null()) { out("drive: " + err); return 1; }
-    if (!folder.empty()) cfg.folder = Wide(folder);
-    if (cfg.folder.empty()) { out("--folder <path> is required the first time"); return 1; }
-    if (cfg.drive_id != id) DeleteFileW(IndexPath().c_str());
-    cfg.drive_id = id; cfg.drive_name = d.value("name", ""); cfg.drive_node = d.value("node", ""); cfg.drive_node_kind = d.value("node_kind", "");
-    SaveConfig(cfg); EnsureDir(cfg.folder);
-    out("syncing drive " + cfg.drive_name + " into " + Utf8(cfg.folder)); return 0;
+    if (folder.empty() == letter.empty()) { out("give --letter Z or --folder <path>"); return 1; }
+    Mapping m; m.id = id; m.name = d.value("name", ""); m.node = d.value("node", ""); m.node_kind = d.value("node_kind", "");
+    if (!letter.empty()) { m.mode = "letter"; m.letter = Wide(letter.substr(0, 1)); m.letter[0] = towupper(m.letter[0]); m.folder = BackingFolder(m.name); }
+    else { m.mode = "folder"; m.folder = Wide(folder); }
+    DriveSet set(cfg, sec.Get("device_secret"));
+    if (auto* old = cfg.Find(id)) { if (old->mode != m.mode || LowerW(old->folder) != LowerW(m.folder) || old->letter != m.letter) set.Remove(id); }
+    if (!cfg.Find(id)) cfg.maps.push_back(m);
+    if (m.mode == "letter" && !MountLetter(m.letter, m.folder, m.name, err)) { out("letter: " + err); set.Remove(id); SaveConfig(cfg); return 1; }
+    EnsureDir(m.folder); SaveConfig(cfg);
+    out("drive " + m.name + " shown at " + Utf8(ShownAt(m)) + (m.mode == "letter" ? " (files in " + Utf8(m.folder) + ")" : "")); return 0;
+  }
+  if (cmd == "remove" && argc > 2) {
+    std::string id = Utf8(argv[2]); if (!cfg.Find(id)) { out("not shown on this PC: " + id); return 1; }
+    { DriveSet set(cfg, ""); set.Remove(id); } SaveConfig(cfg); out("removed from this PC (the files stay)"); return 0;
   }
   if (cmd == "sync") {
     int secs = atoi(Arg(argc, argv, L"--seconds", "0").c_str());
     SetConsoleCtrlHandler(OnCtrl, TRUE);
-    Engine eng(cfg, sec.Get("device_secret")); eng.Start();
-    time_t t0 = Now(); std::string last;
+    if (cfg.maps.empty()) { out("no drive shown on this PC: cdrive use <id> --letter Z | --folder <path>"); return 1; }
+    DriveSet set(cfg, sec.Get("device_secret"));
+    for (auto& n : set.StartAll()) out("  " + n);
+    SaveConfig(cfg);
+    time_t t0 = Now(); std::map<std::string, std::string> last; bool err = false;
     while (!g_stop && (!secs || Now() - t0 < secs)) {
-      Sleep(2000); auto st = eng.Status();
-      std::string line = st.state + "  " + st.detail + (st.pending ? "  pending " + std::to_string(st.pending) : "") + (st.bytesTotal ? "  " + Human(st.bytesDone) + "/" + Human(st.bytesTotal) : "") + (st.nodeUrl.empty() ? "" : "  @ " + st.nodeUrl);
-      if (line != last) { out(TimeLocal(Now()) + "  " + line); last = line; }
-      if (st.state == "setup" || st.state == "error") break;
+      Sleep(2000);
+      for (auto& m : cfg.maps) {
+        auto st = set.Status(m.id);
+        std::string line = st.state + "  " + st.detail + (st.pending ? "  pending " + std::to_string(st.pending) : "") + (st.bytesTotal ? "  " + Human(st.bytesDone) + "/" + Human(st.bytesTotal) : "") + (st.nodeUrl.empty() ? "" : "  @ " + st.nodeUrl);
+        if (line != last[m.id]) { out(TimeLocal(Now()) + "  " + (cfg.maps.size() > 1 ? "[" + m.name + "] " : "") + line); last[m.id] = line; }
+        if (st.state == "error") err = true;
+      }
+      if (err) break;
     }
-    eng.Stop();
-    auto st = eng.Status(); for (auto& r : st.recent) out("  " + TimeLocal(r.at) + "  " + r.what + "  " + r.path + (r.by.empty() ? "" : "  (" + r.by + ")"));
-    return st.state == "error" ? 1 : 0;
+    for (auto& m : cfg.maps) for (auto& r : set.Status(m.id).recent) out("  " + TimeLocal(r.at) + "  " + (cfg.maps.size() > 1 ? "[" + m.name + "] " : "") + r.what + "  " + r.path + (r.by.empty() ? "" : "  (" + r.by + ")"));
+    set.StopAll();
+    return err ? 1 : 0;
   }
-  out("cdrive " CD_VERSION_STR ": pair | unlink | drives | create | use | sync | status | log"); return 2;
+  out("cdrive " CD_VERSION_STR ": pair | unlink | drives | create | use | remove | sync | status | log"); return 2;
 }

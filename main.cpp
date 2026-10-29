@@ -1,12 +1,12 @@
-// main.cpp — ChronoDrive.exe: the tray app. Keeps one local folder in sync with a drive on the Miniserver (sync.hpp);
-// a ChronoUI window for the setup (pair, pick or create a drive, pick the folder) and the status (recent changes, log).
+// main.cpp — ChronoDrive.exe: the tray app. Shows each of the account's drives as a card; "Show on this PC" puts a
+// drive on this PC as a drive letter (Z:) or in a folder, and keeps it in sync (drives.hpp, sync.hpp).
 #include <windows.h>
 #include <objbase.h>
 #include <shobjidl.h>
 #include <shellapi.h>
 #include <deque>
 #include <memory>
-#include "sync.hpp"
+#include "drives.hpp"
 #include "VirtualWidget.hpp"
 #include "VirtualChat.hpp"
 #include "VControls.hpp"
@@ -22,7 +22,8 @@ using cd::json;
 constexpr UINT WM_APP_RESULT = WM_APP + 1;
 constexpr UINT WM_APP_TRAY = WM_APP + 3;
 constexpr UINT kTrayId = 1;
-enum { kMenuOpen = 101, kMenuFolder = 102, kMenuPause = 103, kMenuPage = 104, kMenuExit = 109, kMenuRecent = 200 };
+constexpr int kMaxCards = 6;
+enum { kMenuOpen = 101, kMenuPause = 103, kMenuPage = 104, kMenuExit = 109, kMenuDrive = 200 };
 
 static const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static std::wstring ExePathW() { wchar_t b[MAX_PATH * 2]; GetModuleFileNameW(nullptr, b, MAX_PATH * 2); return b; }
@@ -33,7 +34,8 @@ struct Tray {
   NOTIFYICONDATAW nid{}; bool added = false;
   void Add(HWND hwnd, HINSTANCE inst) {
     nid.cbSize = sizeof nid; nid.hWnd = hwnd; nid.uID = kTrayId; nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; nid.uCallbackMessage = WM_APP_TRAY;
-    nid.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1)); if (!nid.hIcon) nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    nid.hIcon = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+    if (!nid.hIcon) nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wcscpy_s(nid.szTip, L"ChronoDrive"); added = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
     nid.uVersion = NOTIFYICON_VERSION_4; Shell_NotifyIconW(NIM_SETVERSION, &nid);
   }
@@ -41,7 +43,6 @@ struct Tray {
   void Remove() { if (added) { Shell_NotifyIconW(NIM_DELETE, &nid); added = false; } }
 };
 
-// async calls to the Miniserver (never block the UI thread)
 struct AsyncResult { json r; std::string err; std::function<void(const json&, const std::string&)> cb; };
 static HWND g_hwnd = nullptr; static std::mutex g_amx; static std::deque<std::unique_ptr<AsyncResult>> g_aq;
 static void Async(std::function<json(std::string&)> work, std::function<void(const json&, const std::string&)> cb) {
@@ -58,223 +59,347 @@ static std::wstring PickFolder(HWND owner, const std::wstring& start, const wcha
 }
 static std::wstring W(const std::string& s) { return cd::Wide(s); }
 static std::string U(const std::wstring& s) { return cd::Utf8(s); }
+static void OpenPath(const std::wstring& p) { if (!p.empty()) ShellExecuteW(nullptr, L"open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL); }
+static D2D1_COLOR_F Indigo() { return vtheme::IsDark() ? D2D1::ColorF(0xA5B4FC) : D2D1::ColorF(0x4338CA); }
+static D2D1_COLOR_F StateColor(const std::string& st) {
+  if (st == "idle") return D2D1::ColorF(0x059669);
+  if (st == "syncing" || st == "connecting") return D2D1::ColorF(0x2563EB);
+  if (st == "offline" || st == "paused") return D2D1::ColorF(0xD97706);
+  if (st == "error") return D2D1::ColorF(0xDC2626);
+  return vctl::Muted();
+}
 
-// a scrolling block of mono lines (recent changes, log)
+// ------------------------------------------------------------------ a drive card: a disk glyph, the name, where it lives, its state on this PC
+struct CardData { std::wstring name, where, state, detail; std::string stateKey; bool onPc = false, selected = false, panel = false; };
+class VDriveCard : public VirtualWidgetImpl {
+ public:
+  CardData d;
+  const char* GetTypeName() const override { return "VDriveCard"; }
+  void OnDraw(ID2D1RenderTarget* rt) override {
+    vd::Fill(rt, m_bounds, vctl::Surface(), 10.0f);
+    vd::Stroke(rt, m_bounds, d.selected ? Indigo() : vctl::Border(), 10.0f);
+    if (d.panel) return;
+    // the disk glyph: a rounded drive with its slot and its light
+    D2D1_RECT_F g = vd::Rect(m_bounds.left + 18, m_bounds.top + 26, 44, 32);
+    vd::Fill(rt, g, d.onPc ? Indigo() : vctl::Track(), 7.0f);
+    vd::Fill(rt, vd::Rect(g.left + 8, g.top + 21, 20, 4), d.onPc ? D2D1::ColorF(1, 1, 1, 0.55f) : vctl::Border(), 2.0f);
+    vd::Fill(rt, vd::Rect(g.right - 12, g.top + 20, 6, 6), d.onPc ? StateColor(d.stateKey) : vctl::Muted(), 3.0f);
+    float x = m_bounds.left + 80, w = (std::max)(120.0f, m_bounds.right - x - 360);
+    vd::Text(rt, d.name, vd::Rect(x, m_bounds.top + 12, w, 24), vctl::Ink(), vd::Style().Size(17).Bold());
+    vd::Text(rt, d.where, vd::Rect(x, m_bounds.top + 38, w, 20), vctl::Muted(), vd::Style().Size(13.5f));
+    std::wstring line = d.state + d.detail;
+    vd::Text(rt, line, vd::Rect(x, m_bounds.top + 60, m_bounds.right - x - 16, 20), d.onPc ? StateColor(d.stateKey) : vctl::Muted(), vd::Style().Size(14).Bold());
+  }
+};
+
+// a short list of lines (recent changes)
 class VLines : public VirtualWidgetImpl {
-  std::vector<std::wstring> m_lines; float m_scroll = 0;
+  std::vector<std::wstring> m_lines;
  public:
   const char* GetTypeName() const override { return "VLines"; }
   void Lines(std::vector<std::wstring> v) { m_lines = std::move(v); }
   void OnDraw(ID2D1RenderTarget* rt) override {
-    vd::Fill(rt, m_bounds, vctl::Surface(), 6.0f); vd::Stroke(rt, m_bounds, vctl::Border(), 6.0f);
-    const float lh = 17.0f; D2D1_RECT_F in = vd::Inset(m_bounds, 10.0f, 8.0f);
-    float total = lh * (float)m_lines.size(), view = in.bottom - in.top, maxScroll = (std::max)(0.0f, total - view); if (m_scroll > maxScroll) m_scroll = maxScroll; if (m_scroll < 0) m_scroll = 0;
+    const float lh = 22.0f; D2D1_RECT_F in = m_bounds;
     rt->PushAxisAlignedClip(in, D2D1_ANTIALIAS_MODE_ALIASED);
-    if (m_lines.empty()) vd::Text(rt, L"Nothing yet", in, vctl::Muted(), vd::Style().Size(11.5f));
-    for (size_t i = (size_t)(m_scroll / lh); i < m_lines.size(); ++i) {
-      float y = in.top + (float)i * lh - m_scroll; if (y > in.bottom) break;
-      bool warn = m_lines[i].find(L"failed") != std::wstring::npos || m_lines[i].find(L"conflict") != std::wstring::npos || m_lines[i].find(L"cannot") != std::wstring::npos;
-      vd::Text(rt, m_lines[i], vd::Rect(in.left, y, in.right - in.left, lh), warn ? D2D1::ColorF(0.80f, 0.25f, 0.20f) : vctl::Ink(), vd::Style().Size(11.5f).Mono());
+    if (m_lines.empty()) vd::Text(rt, L"Nothing has changed yet.", vd::Rect(in.left, in.top, in.right - in.left, lh), vctl::Muted(), vd::Style().Size(13.5f));
+    for (size_t i = 0; i < m_lines.size(); ++i) {
+      float y = in.top + (float)i * lh; if (y + lh > in.bottom) break;
+      bool warn = m_lines[i].find(L"conflict") != std::wstring::npos;
+      vd::Text(rt, m_lines[i], vd::Rect(in.left, y, in.right - in.left, lh), warn ? D2D1::ColorF(0xD97706) : vctl::Ink(), vd::Style().Size(13.5f));
     }
     rt->PopAxisAlignedClip();
   }
-  VInputResult OnMouseWheel(float delta, float, float) override { m_scroll -= (delta > 0 ? 1.0f : -1.0f) * 3 * 17.0f; return VInputResult::Handled; }
 };
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   lockDpiAwareness();
-  bool trayStart = false;
-  { int argc = 0; LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc); for (int i = 1; argv && i < argc; ++i) if (!wcscmp(argv[i], L"--tray")) trayStart = true; if (argv) LocalFree(argv); }
-  const UINT WM_SHOWME = RegisterWindowMessageW(L"ChronoDrive.Show");
-  HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\ChronoDrive.App");
+  bool trayStart = false; std::string showId;   // --show <drive id>: open that drive's "show on this PC" panel
+  { int argc = 0; LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    for (int i = 1; argv && i < argc; ++i) { if (!wcscmp(argv[i], L"--tray")) trayStart = true; else if (!wcscmp(argv[i], L"--show") && i + 1 < argc) showId = cd::Utf8(argv[++i]); }
+    if (argv) LocalFree(argv); }
+  // One instance per data folder: CHRONODRIVE_DATA (tests, a second account) gets its own lock and its own "show" message.
+  std::wstring inst = cd::EnvW(L"CHRONODRIVE_DATA"); for (auto& c : inst) if (c == L'\\' || c == L':' || c == L'/') c = L'_';
+  const UINT WM_SHOWME = RegisterWindowMessageW((L"ChronoDrive.Show" + inst).c_str());
+  HANDLE single = CreateMutexW(nullptr, TRUE, (L"Local\\ChronoDrive.App" + inst).c_str());
   if (GetLastError() == ERROR_ALREADY_EXISTS) { PostMessageW(HWND_BROADCAST, WM_SHOWME, 0, 0); return 0; }
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   ChronoControllerImpl::Instance();
   try {
   VirtualWindow win;
-  if (!win.Create(hInstance, L"ChronoDrive " CD_VERSION_WSTR, 860, 720, false, 36.0f, trayStart)) return 1;
+  if (!win.Create(hInstance, L"ChronoDrive " CD_VERSION_WSTR, 840, 720, false, 36.0f, trayStart)) return 1;
   win.SetBackground(vtheme::Current().window);
   g_hwnd = win.GetHWND();
   auto repaint = [] { InvalidateRect(g_hwnd, nullptr, FALSE); };
   Tray tray; tray.Add(g_hwnd, hInstance);
   auto showWindow = [&] { ShowWindow(g_hwnd, SW_SHOW); if (IsIconic(g_hwnd)) ShowWindow(g_hwnd, SW_RESTORE); SetForegroundWindow(g_hwnd); };
-  auto hideToTray = [&] { ShowWindow(g_hwnd, SW_HIDE); };
 
   // ---- state
   cd::Config cfg = cd::LoadConfig(); cd::Secrets sec; sec.Load();
-  std::unique_ptr<cd::Engine> eng;
-  json drives = json::array(), places = json::array();
-  std::string linkCode, linkSecret, linkUrl; bool busy = false; float tick = 0.9f, tick10 = 0;
-  std::function<void()> relayout;
+  cd::DriveSet set(cfg, sec.Get("device_secret"));
+  json drives = json::array();                    // the account's drives (from the Miniserver)
+  std::string linkCode, linkSecret, linkUrl, mapId, serverNote; bool busy = false, loaded = false; float tick = 0.9f, tick30 = 0;
+  auto linked = [&] { return !cfg.device_id.empty() && !sec.Get("device_secret").empty(); };
 
   auto* msgDlg = win.AddChrome<VDialog>(); msgDlg->Attach(&win); msgDlg->Primary(L"OK");
-  auto showMsg = [&](const std::wstring& title, const std::wstring& body) { msgDlg->Title(title).Body(body); msgDlg->Open(); repaint(); };
-  auto* confirmDlg = win.AddChrome<VDialog>(); confirmDlg->Attach(&win); confirmDlg->Primary(L"Unlink").CloseText(L"Cancel").Accent(D2D1::ColorF(0.80f, 0.25f, 0.20f));
+  auto showMsg = [&](const std::wstring& t, const std::wstring& b) { msgDlg->Title(t).Body(b); msgDlg->Open(); repaint(); };
+  auto* confirmDlg = win.AddChrome<VDialog>(); confirmDlg->Attach(&win); confirmDlg->Primary(L"Remove").CloseText(L"Cancel").Accent(D2D1::ColorF(0xDC2626));
+  std::function<void()> onConfirm;
+  confirmDlg->OnResult([&](int r) { auto f = onConfirm; onConfirm = nullptr; if (r == 0 && f) f(); });
+  auto ghost = [](VButton* b) { b->Face(vctl::Subtle()).FaceHover(vctl::Track()).FacePress(vctl::Border()).TextColor(vctl::Ink()); return b; };
+  auto primary = [](VButton* b) { b->Face(Indigo()).FaceHover(D2D1::ColorF(0x3730A3)).FacePress(D2D1::ColorF(0x312E81)).TextColor(D2D1::ColorF(1, 1, 1)); return b; };
 
-  auto lbl = [&](const wchar_t* t) { auto* l = win.Add<VLabel>(); l->Text(t).FontSize(12.0f).Muted(true); return l; };
-  auto input = [&](const wchar_t* ph) { auto* b = win.Add<VChatInput>(); b->SetSingleLine(true).SetPlaceholder(ph).SetFontSize(12.5f); return b; };
-
-  // ---- header: state
-  auto* title = win.Add<VLabel>(); title->Text(L"ChronoDrive").FontSize(18.0f);
-  auto* stateLbl = win.Add<VLabel>(); stateLbl->Text(L"").FontSize(13.0f);
-  auto* detailLbl = win.Add<VLabel>(); detailLbl->Text(L"").FontSize(11.5f).Muted(true);
-  auto* pauseBtn = win.Add<VButton>(); pauseBtn->Text(L"Pause");
-  auto* openBtn = win.Add<VButton>(); openBtn->Text(L"Open folder");
-  // ---- account
-  auto* lAccount = lbl(L"Account");
-  auto* accountLbl = win.Add<VLabel>(); accountLbl->Text(L"").FontSize(12.5f);
-  auto* urlBox = input(L"https://cs-miniserver.chronoscan.org"); urlBox->SetText(W(cfg.url));
-  auto* pairBtn = win.Add<VButton>(); pairBtn->Text(L"Pair this PC");
-  auto* unlinkBtn = win.Add<VButton>(); unlinkBtn->Text(L"Unlink");
-  // ---- drive
-  auto* lDrive = lbl(L"Drive");
-  auto* driveCombo = win.Add<VCombo>(); driveCombo->Items({L"(no drives yet)"}).Select(0).FontSize(12.5f);
-  auto* refreshBtn = win.Add<VButton>(); refreshBtn->Text(L"Refresh");
-  auto* pageBtn = win.Add<VButton>(); pageBtn->Text(L"Manage on the web");
-  auto* lNew = lbl(L"New drive");
-  auto* newName = input(L"Documents");
-  auto* newSize = win.Add<VStepper>(); newSize->Range(1, 100000).Set(10);
-  auto* lSize = lbl(L"GB");
-  auto* nodeCombo = win.Add<VCombo>(); nodeCombo->Items({L"(no place yet)"}).Select(0).FontSize(12.5f);
-  auto* backupChk = win.Add<VCheck>(L"Daily backup on the node");
-  auto* createBtn = win.Add<VButton>(); createBtn->Text(L"Create drive");
-  // ---- folder
-  auto* lFolder = lbl(L"Local folder");
-  auto* folderBox = input(L"C:\\Users\\you\\ChronoDrive\\Documents"); folderBox->SetText(cfg.folder);
-  auto* browseBtn = win.Add<VButton>(); browseBtn->Text(L"Browse\x2026");
-  auto* startBtn = win.Add<VButton>(); startBtn->Text(L"Start syncing");
-  auto* autostartChk = win.Add<VCheck>(L"Start with Windows (tray icon)"); autostartChk->Set(AutostartEnabled());
-  // ---- recent and log
-  auto* lRecent = lbl(L"Recent changes");
+  // ---- header
+  auto* title = win.Add<VLabel>(); title->Text(L"ChronoDrive").FontSize(22.0f);
+  auto* accountLbl = win.Add<VLabel>(); accountLbl->Text(L"").FontSize(13.5f).Muted(true);
+  auto* unlinkBtn = ghost(win.Add<VButton>()); unlinkBtn->Text(L"Unlink");
+  // ---- pairing (only while not paired)
+  auto* pairTitle = win.Add<VLabel>(); pairTitle->Text(L"Connect this PC to your Miniserver").FontSize(18.0f);
+  auto* pairText = win.Add<VLabel>(); pairText->Text(L"A code opens in the browser: approve it with your account.").FontSize(14.0f).Muted(true);
+  auto* urlBox = win.Add<VChatInput>(); urlBox->SetSingleLine(true).SetPlaceholder(L"https://cs-miniserver.chronoscan.org").SetFontSize(14.0f); urlBox->SetText(W(cfg.url));
+  auto* pairBtn = primary(win.Add<VButton>()); pairBtn->Text(L"Pair this PC");
+  // ---- drives
+  auto* drivesTitle = win.Add<VLabel>(); drivesTitle->Text(L"Your drives").FontSize(18.0f);
+  auto* newBtn = ghost(win.Add<VButton>()); newBtn->Text(L"New drive\x2026");
+  auto* refreshBtn = ghost(win.Add<VButton>()); refreshBtn->Text(L"Refresh");
+  auto* emptyLbl = win.Add<VLabel>(); emptyLbl->Text(L"").FontSize(14.0f).Muted(true);
+  VDriveCard* cards[kMaxCards]; VButton* mainBtn[kMaxCards]; VButton* pauseBtn[kMaxCards]; VButton* removeBtn[kMaxCards];
+  for (int i = 0; i < kMaxCards; ++i) {
+    cards[i] = win.Add<VDriveCard>();
+    mainBtn[i] = primary(win.Add<VButton>());
+    pauseBtn[i] = ghost(win.Add<VButton>()); pauseBtn[i]->Text(L"Pause");
+    removeBtn[i] = ghost(win.Add<VButton>()); removeBtn[i]->Text(L"Remove from PC");
+  }
+  // ---- the "show on this PC" panel (under the chosen card)
+  auto* mapPanel = win.Add<VDriveCard>(); mapPanel->d.panel = true; mapPanel->d.selected = true;
+  auto* mapTitle = win.Add<VLabel>(); mapTitle->Text(L"Show it on this PC as").FontSize(14.5f);
+  auto* mapMode = win.Add<VSegment>(std::vector<std::wstring>{L"A drive letter", L"A folder"});
+  auto* letterCombo = win.Add<VCombo>(); letterCombo->Items({L"Z:"}).Select(0).FontSize(14.0f);
+  auto* folderBox = win.Add<VChatInput>(); folderBox->SetSingleLine(true).SetPlaceholder(L"D:\\Drive").SetFontSize(14.0f);
+  auto* browseBtn = ghost(win.Add<VButton>()); browseBtn->Text(L"Browse\x2026");
+  auto* mapHint = win.Add<VLabel>(); mapHint->Text(L"").FontSize(13.0f).Muted(true);
+  auto* mapOk = primary(win.Add<VButton>()); mapOk->Text(L"Show it");
+  auto* mapCancel = ghost(win.Add<VButton>()); mapCancel->Text(L"Cancel");
+  std::vector<std::wstring> letterChoices; int mapModeSel = 0; std::string openMapLater;
+  // ---- bottom
+  auto* recentTitle = win.Add<VLabel>(); recentTitle->Text(L"Recent changes").FontSize(15.0f);
   auto* recent = win.Add<VLines>();
-  auto* lLog = lbl(L"Log");
-  auto* logView = win.Add<VLines>();
-  auto* footer = win.Add<VLabel>(); footer->Text(L"").FontSize(11.0f).Muted(true);
+  auto* autostartChk = win.Add<VCheck>(L"Start with Windows"); autostartChk->Set(AutostartEnabled());
+  auto* logBtn = ghost(win.Add<VButton>()); logBtn->Text(L"Log");
+  auto* footer = win.Add<VLabel>(); footer->Text(L"").FontSize(12.5f).Muted(true);
 
-  auto linked = [&] { return !cfg.device_id.empty() && !sec.Get("device_secret").empty(); };
-  auto driveIds = std::make_shared<std::vector<std::string>>(); auto placeKeys = std::make_shared<std::vector<std::string>>();
-  auto fillAccount = [&] {
-    accountLbl->Text(linked() ? W("Linked to " + cfg.email + " as " + (cfg.device_name.empty() ? cd::ComputerName() : cfg.device_name)) : L"Not paired. Enter the Miniserver address and press \"Pair this PC\": a code and a QR page open, approve it with your account.");
-    pairBtn->Enabled(!linked() && linkCode.empty()); unlinkBtn->Enabled(linked());
+  std::function<void()> relayout;
+  auto visibleDrives = [&] { std::vector<json> v; for (auto& d : drives) if (!d.value("deleting", false)) v.push_back(d); return v; };
+  auto driveName = [&](const std::string& id) { for (auto& d : drives) if (d.value("id", "") == id) return d.value("name", std::string()); return std::string(); };
+  auto stateText = [&](const cd::Mapping& m, std::string& key, std::wstring& detail) -> std::wstring {
+    auto st = set.Status(m.id); key = st.state; detail.clear();
+    std::wstring at = cd::ShownAt(m);
+    if (!set.Running(m.id)) { key = "error"; return at + L"   \x00b7   not syncing"; }
+    if (st.state == "idle") return at + L"   \x00b7   Up to date";
+    if (st.state == "syncing") return at + L"   \x00b7   Syncing" + (st.pending ? L", " + std::to_wstring(st.pending) + L" left" : L"") + (st.bytesTotal ? L" (" + W(cd::Human(st.bytesDone)) + L" of " + W(cd::Human(st.bytesTotal)) + L")" : L"");
+    if (st.state == "paused") return at + L"   \x00b7   Paused";
+    if (st.state == "offline") { detail = st.detail.empty() ? L"" : L"   " + W(st.detail); return at + L"   \x00b7   Waiting"; }
+    if (st.state == "error") { detail = L"   " + W(st.detail); return at + L"   \x00b7   Stopped"; }
+    return at + L"   \x00b7   Connecting\x2026";
   };
-  auto fillDrives = [&] {
-    std::vector<std::wstring> items; driveIds->clear(); int sel = 0;
-    for (auto& d : drives) { if (d.value("deleting", false)) continue; driveIds->push_back(d.value("id", "")); if (d.value("id", "") == cfg.drive_id) sel = (int)driveIds->size() - 1;
-      items.push_back(W(d.value("name", "") + "  \xc2\xb7  " + std::to_string(d.value("size_gb", 0)) + " GB on " + d.value("node", "") + (d.value("online", false) ? "" : "  (node offline)"))); }
-    if (items.empty()) items.push_back(L"(no drives yet: create one below)");
-    driveCombo->Items(items).Select(sel);
-    std::vector<std::wstring> ps; placeKeys->clear();
-    for (auto& p : places) { placeKeys->push_back(p.value("node", "") + "|" + p.value("fs_uuid", "")); ps.push_back(W(p.value("node", "") + " (" + p.value("kind", "") + ")  " + std::to_string(p.value("free_gb", 0)) + " GB free")); }
-    if (ps.empty()) ps.push_back(L"(no node with room for a drive)");
-    nodeCombo->Items(ps).Select(0);
-    createBtn->Enabled(!placeKeys->empty());
+  auto fill = [&] {
+    bool paired = linked();
+    accountLbl->Text(paired ? W(cfg.email.empty() ? "Paired" : cfg.email) : L"");
+    unlinkBtn->SetVisible(paired);
+    pairTitle->SetVisible(!paired); pairText->SetVisible(!paired); urlBox->SetVisible(!paired); pairBtn->SetVisible(!paired);
+    pairBtn->Enabled(linkCode.empty());
+    drivesTitle->SetVisible(paired); newBtn->SetVisible(paired); refreshBtn->SetVisible(paired); recentTitle->SetVisible(paired); recent->SetVisible(paired);
+    auto vis = visibleDrives();
+    emptyLbl->Text(!paired ? L"" : !loaded ? L"Loading your drives\x2026" : vis.empty() ? L"You have no drive yet. \"New drive\x2026\" creates one on the web." : L"");
+    emptyLbl->SetVisible(paired && !emptyLbl->GetText().empty());
+    for (int i = 0; i < kMaxCards; ++i) {
+      bool on = paired && i < (int)vis.size();
+      cards[i]->SetVisible(on); mainBtn[i]->SetVisible(on); pauseBtn[i]->SetVisible(false); removeBtn[i]->SetVisible(false);
+      if (!on) continue;
+      const json& d = vis[(size_t)i]; std::string id = d.value("id", "");
+      CardData c; c.name = W(d.value("name", ""));
+      std::string node = d.value("node", ""); bool home = d.value("node_kind", "") == "home";
+      c.where = std::to_wstring(d.value("size_gb", 0)) + L" GB   \x00b7   " + W(cd::Human(d.value("used", (uint64_t)0))) + L" used   \x00b7   "
+              + (home ? L"at home (" + W(node) + L")" : node == "office" ? std::wstring(L"in the office") : L"node " + W(node));
+      c.selected = id == mapId;
+      if (auto* m = cfg.Find(id)) {
+        c.onPc = true; c.state = stateText(*m, c.stateKey, c.detail);
+        mainBtn[i]->Text(L"Open"); pauseBtn[i]->SetVisible(true); removeBtn[i]->SetVisible(true);
+        pauseBtn[i]->Text(m->paused ? L"Resume" : L"Pause");
+      } else {
+        c.state = L"Not on this PC"; c.stateKey = "setup";
+        mainBtn[i]->Text(L"Show on this PC");
+      }
+      cards[i]->d = c;
+    }
+    bool mapping = paired && !mapId.empty();
+    mapPanel->SetVisible(mapping); mapTitle->SetVisible(mapping); mapMode->SetVisible(mapping); mapHint->SetVisible(mapping); mapOk->SetVisible(mapping); mapCancel->SetVisible(mapping);
+    bool letter = mapModeSel == 0;
+    letterCombo->SetVisible(mapping && letter); folderBox->SetVisible(mapping && !letter); browseBtn->SetVisible(mapping && !letter);
+    mapHint->Text(letter ? L"Its own disk in Explorer. The files are kept in " + cd::BackingFolder(driveName(mapId)) + L"."
+                         : L"The folder gets the drive's files and stays in step with it.");
+    // tray and recent changes
+    std::string all = set.Overall();
+    tray.Tip(cfg.maps.empty() ? L"ChronoDrive" : all == "idle" ? L"ChronoDrive \x2014 up to date" : all == "syncing" ? L"ChronoDrive \x2014 syncing" : all == "offline" ? L"ChronoDrive \x2014 waiting for a drive" : L"ChronoDrive \x2014 " + W(all));
+    std::vector<std::pair<time_t, std::wstring>> rs;
+    for (auto& m : cfg.maps) for (auto& r : set.Status(m.id).recent) rs.push_back({r.at, W(cd::TimeLocal(r.at)) + L"    " + W(m.name) + L"    " + W(r.what) + L"   " + W(r.path)});
+    std::sort(rs.begin(), rs.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    std::vector<std::wstring> lines; for (size_t i = 0; i < rs.size() && i < 8; ++i) lines.push_back(rs[i].second);
+    recent->Lines(lines);
+    footer->Text(serverNote.empty() ? W(cfg.url) : W(serverNote));
+    if (relayout) relayout();
   };
+
   auto loadDrives = [&] {
     if (!linked()) return;
     cd::Config c = cfg; std::string secret = sec.Get("device_secret");
-    Async([c, secret](std::string& err) { cd::Miniserver ms(c.url, c.standby, c.device_id, secret); json d = ms.Json(L"GET", "/api/ms/drive/drives", nullptr, err); if (d.is_null()) return json(); json n = ms.Json(L"GET", "/api/ms/drive/nodes", nullptr, err); return json({{"drives", d["drives"]}, {"places", n.is_null() ? json::array() : n["nodes"]}}); },
-      [&](const json& r, const std::string& err) { if (!err.empty()) { footer->Text(W("Miniserver: " + err)); repaint(); return; } drives = r["drives"]; places = r["places"]; fillDrives(); repaint(); });
+    Async([c, secret](std::string& err) { cd::Miniserver ms(c.url, c.standby, c.device_id, secret); json d = ms.Json(L"GET", "/api/ms/drive/drives", nullptr, err); return d.is_null() ? json() : d["drives"]; },
+      [&](const json& r, const std::string& err) {
+        if (!err.empty()) { serverNote = err == "revoked" ? "This PC was unlinked on the Miniserver: pair it again." : "Miniserver: " + err; fill(); repaint(); return; }
+        serverNote.clear(); drives = r; loaded = true;
+        if (!showId.empty()) { std::string id = showId; showId.clear(); for (auto& d : drives) if (d.value("id", "") == id && !cfg.Find(id)) openMapLater = id; }
+        for (auto& m : cfg.maps) for (auto& d : drives) if (d.value("id", "") == m.id) { m.name = d.value("name", m.name); m.node = d.value("node", m.node); m.node_kind = d.value("node_kind", m.node_kind); }
+        cd::SaveConfig(cfg); fill(); repaint();
+      });
   };
-  auto startEngine = [&] {
-    if (eng) { eng->Stop(); eng.reset(); }
-    if (!linked() || cfg.drive_id.empty() || cfg.folder.empty()) return;
-    eng = std::make_unique<cd::Engine>(cfg, sec.Get("device_secret")); eng->Pause(cfg.paused); eng->Start();
-  };
-  auto applyStatus = [&] {
-    if (!eng) { stateLbl->Text(linked() ? L"Not syncing yet: pick a drive and a folder, then \"Start syncing\"." : L"Not paired."); detailLbl->Text(L""); tray.Tip(L"ChronoDrive: not set up"); return; }
-    auto st = eng->Status();
-    std::wstring s = st.state == "idle" ? L"Up to date" : st.state == "syncing" ? L"Syncing" + (st.pending ? L" (" + std::to_wstring(st.pending) + L" left" + (st.bytesTotal ? L", " + W(cd::Human(st.bytesDone)) + L" of " + W(cd::Human(st.bytesTotal)) : L"") + L")" : L"") : st.state == "paused" ? L"Paused" : st.state == "offline" ? L"Waiting: drive not reachable" : st.state == "connecting" ? L"Connecting" : st.state == "error" ? L"Stopped" : L"Setup";
-    stateLbl->Text(s); detailLbl->Text(W(st.detail) + (st.nodeUrl.empty() ? L"" : L"   \xc2\xb7   " + W(st.nodeUrl)) + (st.lastSync ? L"   \xc2\xb7   last sync " + W(cd::TimeLocal(st.lastSync)) : L""));
-    tray.Tip(L"ChronoDrive \xe2\x80\x94 " + s);
-    pauseBtn->Text(st.state == "paused" ? L"Resume" : L"Pause");
-    std::vector<std::wstring> lines; for (auto& r : st.recent) lines.push_back(W(cd::TimeLocal(r.at) + "  " + r.what + "  " + r.path + (r.by.empty() ? "" : "  (" + r.by + ")")));
-    recent->Lines(lines);
-  };
-  auto refreshLog = [&] { std::vector<std::wstring> l; for (auto& s : cd::LogTail(200)) l.push_back(W(s)); logView->Lines(l); };
 
+  auto openMap = [&](const std::string& id) {
+    mapId = id;
+    cd::Mapping* m = cfg.Find(id);
+    letterChoices = cd::FreeLetters(m ? m->letter : L"");
+    std::vector<std::wstring> items; for (auto& L : letterChoices) items.push_back(L + L":");
+    if (items.empty()) items.push_back(L"(none free)");
+    letterCombo->Items(items).Select(0);
+    folderBox->SetText(cd::JoinPath(cd::JoinPath(cd::EnvW(L"USERPROFILE"), L"ChronoDrive"), cd::SafeName(driveName(id))));
+    mapModeSel = 0; mapMode->Set(0);
+    fill(); repaint();
+  };
+  auto idAt = [&](int i) { auto vis = visibleDrives(); return i < (int)vis.size() ? vis[(size_t)i].value("id", std::string()) : std::string(); };
+  for (int i = 0; i < kMaxCards; ++i) {
+    mainBtn[i]->OnClick([&, i] {
+      std::string id = idAt(i); if (id.empty()) return;
+      if (auto* m = cfg.Find(id)) OpenPath(cd::ShownAt(*m) + (m->mode == "letter" ? L"\\" : L""));
+      else openMap(id);
+    });
+    pauseBtn[i]->OnClick([&, i] { std::string id = idAt(i); if (auto* m = cfg.Find(id)) { set.Pause(id, !m->paused); cd::SaveConfig(cfg); fill(); repaint(); } });
+    removeBtn[i]->OnClick([&, i] {
+      std::string id = idAt(i); auto* m = cfg.Find(id); if (!m) return;
+      confirmDlg->Title(L"Remove \"" + W(m->name) + L"\" from this PC?").Body(L"It stops syncing here" + std::wstring(m->mode == "letter" ? L" and its drive letter goes" : L"") + L". The files stay in " + m->folder + L". The drive on the Miniserver is not touched.");
+      onConfirm = [&, id] { set.Remove(id); cd::SaveConfig(cfg); fill(); repaint(); };
+      confirmDlg->Open(); repaint();
+    });
+  }
+  mapMode->OnChange([&](int s) { mapModeSel = s; fill(); repaint(); });
+  browseBtn->OnClick([&] { std::wstring p = PickFolder(g_hwnd, folderBox->GetText(), L"Folder for this drive"); if (!p.empty()) { folderBox->SetText(p); repaint(); } });
+  mapCancel->OnClick([&] { mapId.clear(); fill(); repaint(); });
+  mapOk->OnClick([&] {
+    json d; for (auto& x : drives) if (x.value("id", "") == mapId) d = x;
+    if (d.is_null()) { mapId.clear(); fill(); return; }
+    cd::Mapping m; m.id = mapId; m.name = d.value("name", ""); m.node = d.value("node", ""); m.node_kind = d.value("node_kind", "");
+    if (mapModeSel == 0) {
+      size_t s = letterCombo->SelectedIndex(); if (s >= letterChoices.size()) { showMsg(L"No free letter", L"Every drive letter is taken on this PC. Use a folder instead."); return; }
+      m.mode = "letter"; m.letter = letterChoices[s]; m.folder = cd::BackingFolder(m.name);
+    } else {
+      std::wstring f = folderBox->GetText(); if (f.empty()) { showMsg(L"Folder", L"Pick a folder."); return; }
+      m.mode = "folder"; m.folder = f;
+    }
+    for (auto& o : cfg.maps) if (o.id != m.id && cd::LowerW(o.folder) == cd::LowerW(m.folder)) { showMsg(L"Folder in use", L"Another drive already uses " + m.folder + L"."); return; }
+    set.Remove(m.id);
+    cfg.maps.push_back(m);
+    std::string err = set.Start(cfg.maps.back());
+    if (!err.empty()) { set.Remove(m.id); showMsg(L"Cannot show it", W(err)); fill(); return; }
+    cd::SaveConfig(cfg); mapId.clear(); fill(); repaint();
+    if (m.mode == "letter") OpenPath(cd::LetterRoot(m.letter) + L"\\");
+  });
   pairBtn->OnClick([&] {
     std::string url = U(urlBox->GetText()); while (!url.empty() && url.back() == '/') url.pop_back(); if (url.empty()) url = cd::kDefaultServer;
-    linkUrl = url; pairBtn->Enabled(false); accountLbl->Text(L"Asking the Miniserver for a pairing code\x2026"); repaint();
+    linkUrl = url; pairBtn->Enabled(false); pairText->Text(L"Asking for a code\x2026"); repaint();
     Async([url](std::string& err) { return cd::Miniserver::LinkStart(url, cd::ComputerName(), err); }, [&](const json& r, const std::string& err) {
-      if (!err.empty()) { accountLbl->Text(W("Cannot start pairing: " + err)); pairBtn->Enabled(true); repaint(); return; }
+      if (!err.empty()) { pairText->Text(W("Cannot start: " + err)); pairBtn->Enabled(true); repaint(); return; }
       linkCode = r.value("code", ""); linkSecret = r.value("secret", "");
-      ShellExecuteW(nullptr, L"open", W(r.value("qr_page", "")).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-      accountLbl->Text(W("Pairing code " + linkCode + ": scan the QR or approve it at " + r.value("link_url", "") + " \xe2\x80\xa6")); repaint();
+      OpenPath(W(r.value("qr_page", "")));
+      pairText->Text(W("Code " + linkCode + ": approve it in the browser.")); repaint();
     });
   });
-  confirmDlg->OnResult([&](int r) { if (r != 0) return; if (eng) { eng->Stop(); eng.reset(); } sec.Clear(); sec.Save(); cfg.email.clear(); cfg.device_id.clear(); cfg.drive_id.clear(); cd::SaveConfig(cfg); DeleteFileW(cd::IndexPath().c_str()); drives = json::array(); places = json::array(); fillAccount(); fillDrives(); applyStatus(); repaint(); });
-  unlinkBtn->OnClick([&] { confirmDlg->Title(L"Unlink this PC?").Body(L"The account's credentials are forgotten on this PC and syncing stops. The files in the local folder and on the drive stay as they are."); confirmDlg->Open(); repaint(); });
-  refreshBtn->OnClick([&] { loadDrives(); });
-  pageBtn->OnClick([&] { ShellExecuteW(nullptr, L"open", W(cfg.url + "/chronodrive/#mine").c_str(), nullptr, nullptr, SW_SHOWNORMAL); });
-  createBtn->OnClick([&] {
-    int s = (int)nodeCombo->SelectedIndex(); if (s < 0 || s >= (int)placeKeys->size()) return;
-    std::string key = (*placeKeys)[(size_t)s], node = key.substr(0, key.find('|')), fs = key.substr(key.find('|') + 1), name = U(newName->GetText());
-    if (name.empty()) { showMsg(L"New drive", L"Give the drive a name."); return; }
-    json body = {{"name", name}, {"node", node}, {"fs_uuid", fs}, {"size_gb", newSize->Value()}, {"backup", backupChk->Value()}};
-    cd::Config c = cfg; std::string secret = sec.Get("device_secret"); createBtn->Enabled(false);
-    Async([c, secret, body](std::string& err) { cd::Miniserver ms(c.url, c.standby, c.device_id, secret); return ms.Json(L"POST", "/api/ms/drive/drives", body, err); }, [&](const json& r, const std::string& err) {
-      createBtn->Enabled(true); if (!err.empty()) { showMsg(L"Cannot create the drive", W(err)); return; }
-      cfg.drive_id = r.value("id", ""); cfg.drive_name = r.value("name", ""); cfg.drive_node = r.value("node", ""); cfg.drive_node_kind = r.value("node_kind", ""); cd::SaveConfig(cfg); loadDrives();
-    });
+  unlinkBtn->OnClick([&] {
+    confirmDlg->Title(L"Unlink this PC?").Body(L"Every drive stops syncing here and the drive letters go. The files stay on this PC and on the Miniserver.");
+    onConfirm = [&] { std::vector<std::string> ids; for (auto& m : cfg.maps) ids.push_back(m.id); for (auto& id : ids) set.Remove(id); sec.Clear(); sec.Save(); cfg.email.clear(); cfg.device_id.clear(); cd::SaveConfig(cfg); drives = json::array(); loaded = false; fill(); repaint(); };
+    confirmDlg->Open(); repaint();
   });
-  browseBtn->OnClick([&] { std::wstring p = PickFolder(g_hwnd, folderBox->GetText(), L"Folder that mirrors the drive on this PC"); if (!p.empty()) { folderBox->SetText(p); repaint(); } });
-  startBtn->OnClick([&] {
-    int s = (int)driveCombo->SelectedIndex(); if (s < 0 || s >= (int)driveIds->size()) { showMsg(L"Drive", L"Pick a drive (or create one)."); return; }
-    std::wstring folder = folderBox->GetText(); if (folder.empty()) { showMsg(L"Folder", L"Pick the local folder."); return; }
-    std::string id = (*driveIds)[(size_t)s];
-    for (auto& d : drives) if (d.value("id", "") == id) { cfg.drive_name = d.value("name", ""); cfg.drive_node = d.value("node", ""); cfg.drive_node_kind = d.value("node_kind", ""); }
-    if (cfg.drive_id != id || cfg.folder != folder) DeleteFileW(cd::IndexPath().c_str());
-    cfg.drive_id = id; cfg.folder = folder; cfg.paused = false; cd::SaveConfig(cfg); cd::EnsureDir(folder);
-    startEngine(); applyStatus(); repaint();
-  });
-  pauseBtn->OnClick([&] { if (!eng) return; cfg.paused = !eng->Paused(); eng->Pause(cfg.paused); cd::SaveConfig(cfg); applyStatus(); repaint(); });
-  openBtn->OnClick([&] { if (!cfg.folder.empty()) ShellExecuteW(nullptr, L"open", cfg.folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL); });
+  refreshBtn->OnClick([&] { loadDrives(); set.KickAll(); });
+  newBtn->OnClick([&] { OpenPath(W(cfg.url + "/chronodrive/#mine")); });
+  logBtn->OnClick([&] { OpenPath(cd::JoinPath(cd::LogDir(), L"chronodrive.log")); });
   autostartChk->OnChange([&](bool on) { SetAutostart(on); });
 
   auto layout = [&] {
-    RECT rc; GetClientRect(g_hwnd, &rc); float Wd = (float)rc.right, H = (float)rc.bottom, pad = 16.0f, cw = Wd - 2 * pad, y = pad;
-    title->SetBounds(vd::Rect(pad, y, 300, 26)); pauseBtn->SetBounds(vd::Rect(Wd - pad - 230, y, 100, 30)); openBtn->SetBounds(vd::Rect(Wd - pad - 120, y, 120, 30)); y += 30;
-    stateLbl->SetBounds(vd::Rect(pad, y, cw, 22)); y += 22; detailLbl->SetBounds(vd::Rect(pad, y, cw, 18)); y += 28;
-    lAccount->SetBounds(vd::Rect(pad, y, cw, 18)); y += 20; accountLbl->SetBounds(vd::Rect(pad, y, cw, 20)); y += 24;
-    urlBox->SetBounds(vd::Rect(pad, y, (std::min)(cw - 280, 420.0f), 32)); pairBtn->SetBounds(vd::Rect(pad + (std::min)(cw - 280, 420.0f) + 10, y, 130, 32)); unlinkBtn->SetBounds(vd::Rect(pad + (std::min)(cw - 280, 420.0f) + 150, y, 100, 32)); y += 44;
-    lDrive->SetBounds(vd::Rect(pad, y, cw, 18)); y += 20; driveCombo->SetBounds(vd::Rect(pad, y, cw - 290, 32)); refreshBtn->SetBounds(vd::Rect(Wd - pad - 280, y, 100, 32)); pageBtn->SetBounds(vd::Rect(Wd - pad - 170, y, 170, 32)); y += 40;
-    lNew->SetBounds(vd::Rect(pad, y, cw, 18)); y += 20;
-    newName->SetBounds(vd::Rect(pad, y, 200, 32)); newSize->SetBounds(vd::Rect(pad + 210, y, 90, 32)); lSize->SetBounds(vd::Rect(pad + 305, y + 7, 30, 18)); nodeCombo->SetBounds(vd::Rect(pad + 340, y, cw - 340 - 370, 32)); backupChk->SetBounds(vd::Rect(Wd - pad - 360, y + 4, 230, 24)); createBtn->SetBounds(vd::Rect(Wd - pad - 120, y, 120, 32)); y += 44;
-    lFolder->SetBounds(vd::Rect(pad, y, cw, 18)); y += 20; folderBox->SetBounds(vd::Rect(pad, y, cw - 260, 32)); browseBtn->SetBounds(vd::Rect(Wd - pad - 250, y, 100, 32)); startBtn->SetBounds(vd::Rect(Wd - pad - 140, y, 140, 32)); y += 38;
-    autostartChk->SetBounds(vd::Rect(pad, y, cw, 24)); y += 32;
-    float rest = H - y - 30, rh = (std::max)(80.0f, rest * 0.45f), lh2 = (std::max)(60.0f, rest - rh - 48);
-    lRecent->SetBounds(vd::Rect(pad, y, cw, 18)); y += 20; recent->SetBounds(vd::Rect(pad, y, cw, rh)); y += rh + 8;
-    lLog->SetBounds(vd::Rect(pad, y, cw, 18)); y += 20; logView->SetBounds(vd::Rect(pad, y, cw, lh2));
-    footer->SetBounds(vd::Rect(pad, H - 24, cw, 18));
-    msgDlg->Cover(Wd, H); confirmDlg->Cover(Wd, H); repaint();
+    RECT rc; GetClientRect(g_hwnd, &rc); float Wd = (float)rc.right, H = (float)rc.bottom, pad = 22.0f, cw = Wd - 2 * pad, y = pad;
+    title->SetBounds(vd::Rect(pad, y, 260, 30)); unlinkBtn->SetBounds(vd::Rect(Wd - pad - 90, y + 2, 90, 30));
+    { float aw = vd::TextWidth(accountLbl->GetText(), vd::Style().Size(13.5f)) + 8; accountLbl->SetBounds(vd::Rect(Wd - pad - 102 - aw, y + 8, aw, 20)); }
+    y += 52;
+    if (!linked()) {
+      pairTitle->SetBounds(vd::Rect(pad, y, cw, 26)); y += 32; pairText->SetBounds(vd::Rect(pad, y, cw, 22)); y += 34;
+      float ub = (std::min)(cw - 170, 440.0f);
+      urlBox->SetBounds(vd::Rect(pad, y, ub, 36)); pairBtn->SetBounds(vd::Rect(pad + ub + 12, y, 150, 36)); y += 56;
+    }
+    drivesTitle->SetBounds(vd::Rect(pad, y, 200, 26)); newBtn->SetBounds(vd::Rect(Wd - pad - 120, y - 2, 120, 32)); refreshBtn->SetBounds(vd::Rect(Wd - pad - 232, y - 2, 100, 32)); y += 40;
+    if (emptyLbl->IsVisible()) { emptyLbl->SetBounds(vd::Rect(pad, y, cw, 22)); y += 34; }
+    auto vis = visibleDrives();
+    for (int i = 0; i < kMaxCards; ++i) {
+      if (!cards[i]->IsVisible()) continue;
+      const float ch = 90.0f;
+      cards[i]->SetBounds(vd::Rect(pad, y, cw, ch));
+      float bx = Wd - pad - 16;
+      if (removeBtn[i]->IsVisible()) {
+        removeBtn[i]->SetBounds(vd::Rect(bx - 132, y + 16, 132, 32)); bx -= 140;
+        pauseBtn[i]->SetBounds(vd::Rect(bx - 84, y + 16, 84, 32)); bx -= 92;
+        mainBtn[i]->SetBounds(vd::Rect(bx - 84, y + 16, 84, 32));
+      } else mainBtn[i]->SetBounds(vd::Rect(bx - 150, y + 16, 150, 32));
+      y += ch + 10;
+      if (i < (int)vis.size() && vis[(size_t)i].value("id", "") == mapId && mapPanel->IsVisible()) {
+        const float ph = 156.0f; float px = pad + 30, py = y;
+        mapPanel->SetBounds(vd::Rect(pad + 14, py, cw - 14, ph));
+        mapTitle->SetBounds(vd::Rect(px, py + 18, 190, 22)); mapMode->SetBounds(vd::Rect(px + 190, py + 13, 300, 32));
+        letterCombo->SetBounds(vd::Rect(px, py + 58, 120, 36));
+        folderBox->SetBounds(vd::Rect(px, py + 58, cw - 220, 36)); browseBtn->SetBounds(vd::Rect(px + cw - 210, py + 60, 110, 32));
+        mapHint->SetBounds(vd::Rect(px, py + 104, cw - 320, 40));
+        mapCancel->SetBounds(vd::Rect(Wd - pad - 16 - 100, py + ph - 48, 100, 34)); mapOk->SetBounds(vd::Rect(Wd - pad - 16 - 220, py + ph - 48, 110, 34));
+        y += ph + 12;
+      }
+    }
+    float by = (std::max)(y + 10, H - 250.0f);
+    recentTitle->SetBounds(vd::Rect(pad, by, cw, 22)); recent->SetBounds(vd::Rect(pad, by + 30, cw, (std::max)(22.0f, H - by - 30 - 60)));
+    autostartChk->SetBounds(vd::Rect(pad, H - 44, 220, 26)); logBtn->SetBounds(vd::Rect(Wd - pad - 70, H - 46, 70, 30));
+    footer->SetBounds(vd::Rect(pad + 230, H - 40, cw - 320, 20));
+    msgDlg->Cover(Wd, H); confirmDlg->Cover(Wd, H);
   };
-  relayout = layout; win.OnResize(layout);
-  fillAccount(); fillDrives(); layout(); loadDrives(); startEngine(); applyStatus(); refreshLog();
+  relayout = [&] { layout(); };
+  win.OnResize([&] { layout(); repaint(); });
+  if (linked()) { auto notes = set.StartAll(); cd::SaveConfig(cfg); if (!notes.empty()) serverNote = notes[0]; }
+  fill(); loadDrives();
 
   win.OnMessage([&](UINT msg, WPARAM, LPARAM lp) -> bool {
     if (msg == WM_SHOWME) { showWindow(); return true; }
-    if (msg == WM_CLOSE) { hideToTray(); return true; }
+    if (msg == WM_CLOSE) { ShowWindow(g_hwnd, SW_HIDE); return true; }
     if (msg == WM_APP_TRAY) {
       UINT ev = LOWORD(lp);
       if (ev == WM_LBUTTONUP || ev == WM_LBUTTONDBLCLK || ev == NIN_SELECT || ev == NIN_KEYSELECT) { showWindow(); return true; }
       if (ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU) {
-        HMENU m = CreatePopupMenu(); std::wstring st = stateLbl->GetText();
-        AppendMenuW(m, MF_STRING | MF_GRAYED, 0, st.empty() ? L"ChronoDrive" : st.c_str());
-        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        HMENU m = CreatePopupMenu();
         AppendMenuW(m, MF_STRING, kMenuOpen, L"Open ChronoDrive");
-        AppendMenuW(m, MF_STRING | (cfg.folder.empty() ? MF_GRAYED : 0), kMenuFolder, L"Open folder");
-        AppendMenuW(m, MF_STRING | (eng ? 0 : MF_GRAYED), kMenuPause, eng && eng->Paused() ? L"Resume sync" : L"Pause sync");
+        if (!cfg.maps.empty()) AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        for (size_t i = 0; i < cfg.maps.size() && i < 20; ++i) AppendMenuW(m, MF_STRING, kMenuDrive + (UINT)i, (W(cfg.maps[i].name) + L"   (" + cd::ShownAt(cfg.maps[i]) + L")").c_str());
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        bool anyRunning = false; for (auto& x : cfg.maps) if (!x.paused) anyRunning = true;
+        AppendMenuW(m, MF_STRING | (cfg.maps.empty() ? MF_GRAYED : 0), kMenuPause, anyRunning ? L"Pause all" : L"Resume all");
         AppendMenuW(m, MF_STRING, kMenuPage, L"Your drives on the Miniserver");
-        if (eng) { auto s = eng->Status(); if (!s.recent.empty()) { HMENU r = CreatePopupMenu(); int i = 0; for (auto& c : s.recent) AppendMenuW(r, MF_STRING | MF_GRAYED, kMenuRecent + i++, W(cd::TimeLocal(c.at) + "  " + c.what + "  " + c.path).c_str()); AppendMenuW(m, MF_POPUP, (UINT_PTR)r, L"Recent changes"); } }
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(m, MF_STRING, kMenuExit, L"Exit (syncing stops)");
         POINT pt; GetCursorPos(&pt); SetForegroundWindow(g_hwnd);
         int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, g_hwnd, nullptr);
         PostMessageW(g_hwnd, WM_NULL, 0, 0); DestroyMenu(m);
         if (cmd == kMenuOpen) showWindow();
-        else if (cmd == kMenuFolder) ShellExecuteW(nullptr, L"open", cfg.folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        else if (cmd == kMenuPause && eng) { cfg.paused = !eng->Paused(); eng->Pause(cfg.paused); cd::SaveConfig(cfg); }
-        else if (cmd == kMenuPage) ShellExecuteW(nullptr, L"open", W(cfg.url + "/chronodrive/#mine").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        else if (cmd >= kMenuDrive && cmd < kMenuDrive + 20 && (size_t)(cmd - kMenuDrive) < cfg.maps.size()) { auto& x = cfg.maps[(size_t)(cmd - kMenuDrive)]; OpenPath(cd::ShownAt(x) + (x.mode == "letter" ? L"\\" : L"")); }
+        else if (cmd == kMenuPause) { for (auto& x : cfg.maps) set.Pause(x.id, anyRunning); cd::SaveConfig(cfg); fill(); }
+        else if (cmd == kMenuPage) OpenPath(W(cfg.url + "/chronodrive/#mine"));
         else if (cmd == kMenuExit) { tray.Remove(); PostQuitMessage(0); }
       }
       return true;
@@ -286,27 +411,32 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     return false;
   });
   win.OnTick([&](float dt) {
-    tick += dt; tick10 += dt;
+    tick += dt; tick30 += dt;
     if (tick >= 1.0f) {
-      tick = 0; applyStatus(); repaint();
+      tick = 0; fill(); repaint();
       if (!linkCode.empty() && !busy) {
         busy = true; std::string url = linkUrl, code = linkCode, secret = linkSecret;
-        Async([url, code, secret](std::string& err) { std::string st; json p = cd::Miniserver::LinkPoll(url, code, secret, st, err); if (p.is_null()) p = json::object(); p["_status"] = st; return p; }, [&](const json& p, const std::string& err) {
+        Async([url, code, secret](std::string& err) { std::string st; json p = cd::Miniserver::LinkPoll(url, code, secret, st, err); if (p.is_null()) p = json::object(); p["_status"] = st;
+          if (st == "approved") {   // the email: PocketBase hides it in the pairing answer, the owner sees it on auth-refresh
+            cd::Miniserver ms(url, "", p.value("device_id", ""), p.value("device_secret", "")); std::string e2; json me = ms.Json(L"POST", "/api/collections/users/auth-refresh", json::object(), e2);
+            if (me.is_object()) p["_email"] = me.value("record", json::object()).value("email", "");
+          }
+          return p; }, [&](const json& p, const std::string& err) {
           busy = false; std::string st = p.value("_status", "");
           if (st == "pending") return;
           linkCode.clear();
-          if (st != "approved") { accountLbl->Text(W("Pairing " + st + ": " + err)); pairBtn->Enabled(true); repaint(); return; }
-          cfg.url = linkUrl; cfg.email = p.value("record", json::object()).value("email", ""); cfg.device_id = p.value("device_id", ""); cfg.device_name = cd::ComputerName();
-          sec.Set("device_secret", p.value("device_secret", "")); sec.Save(); cd::SaveConfig(cfg);
-          if (cfg.email.empty()) { cd::Config c = cfg; std::string secret = sec.Get("device_secret"); Async([c, secret](std::string& err) { cd::Miniserver ms(c.url, c.standby, c.device_id, secret); return ms.Json(L"POST", "/api/collections/users/auth-refresh", json::object(), err); }, [&](const json& me, const std::string&) { if (me.is_object()) { cfg.email = me.value("record", json::object()).value("email", ""); cd::SaveConfig(cfg); fillAccount(); repaint(); } }); }
-          fillAccount(); loadDrives(); repaint();
+          if (st != "approved") { pairText->Text(W("Pairing " + st + ": " + err)); pairBtn->Enabled(true); fill(); repaint(); return; }
+          cfg.url = linkUrl; cfg.email = p.value("_email", ""); cfg.device_id = p.value("device_id", ""); cfg.device_name = cd::ComputerName();
+          sec.Set("device_secret", p.value("device_secret", "")); sec.Save(); cd::SaveConfig(cfg); set.SetSecret(sec.Get("device_secret"));
+          fill(); loadDrives(); repaint();
         });
       }
     }
-    if (tick10 >= 10.0f) { tick10 = 0; refreshLog(); }
+    if (tick30 >= 30.0f) { tick30 = 0; loadDrives(); }
+    if (!openMapLater.empty()) { std::string id = openMapLater; openMapLater.clear(); openMap(id); }
   });
   int rc = win.RunMessageLoop();
-  if (eng) eng->Stop();
+  set.StopAll();
   tray.Remove();
   if (single) CloseHandle(single);
   CoUninitialize();

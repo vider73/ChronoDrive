@@ -55,7 +55,6 @@ inline std::wstring DataDir() {
 }
 inline std::wstring ConfigPath()  { return JoinPath(DataDir(), L"config.json"); }
 inline std::wstring SecretsPath() { return JoinPath(DataDir(), L"secrets.bin"); }
-inline std::wstring IndexPath()   { return JoinPath(DataDir(), L"index.json"); }
 inline std::wstring LogDir()      { auto d = JoinPath(DataDir(), L"logs"); EnsureDir(d); return d; }
 inline std::wstring LongPath(const std::wstring& p) { return p.rfind(L"\\\\?\\", 0) == 0 ? p : L"\\\\?\\" + p; }
 inline bool ReadTextFile(const std::wstring& path, std::string& out) { std::ifstream f(path, std::ios::binary); if (!f) return false; std::ostringstream ss; ss << f.rdbuf(); out = ss.str(); return true; }
@@ -84,23 +83,58 @@ inline std::vector<std::string> LogTail(size_t lines) {
 }
 
 // ------------------------------------------------------------------ config (plain) and secrets (DPAPI, this user)
+// One Mapping per drive shown on this PC: as a drive letter (the files live in %USERPROFILE%\ChronoDrive\<name> and the
+// letter points there) or in a folder the user picked. Each mapping has its own sync engine and its own index.
+struct Mapping {
+  std::string id, name, node, node_kind;
+  std::string mode = "letter";       // letter | folder
+  std::wstring letter;               // "Z" (mode letter)
+  std::wstring folder;               // where the files are on this PC (the backing folder of a letter, or the user's folder)
+  bool paused = false;
+};
 struct Config {
   std::string url = kDefaultServer, standby, email, device_id, device_name;
+  std::vector<Mapping> maps;
+  // the engine's view of ONE drive (filled per mapping; legacy single-drive configs load into maps)
   std::string drive_id, drive_name, drive_node, drive_node_kind;
   std::wstring folder;
   bool paused = false;
+  Mapping* Find(const std::string& id) { for (auto& m : maps) if (m.id == id) return &m; return nullptr; }
 };
-inline json ToJson(const Config& c) { return {{"url", c.url}, {"standby", c.standby}, {"email", c.email}, {"device_id", c.device_id}, {"device_name", c.device_name}, {"drive", {{"id", c.drive_id}, {"name", c.drive_name}, {"node", c.drive_node}, {"node_kind", c.drive_node_kind}}}, {"folder", Utf8(c.folder)}, {"paused", c.paused}}; }
+inline std::wstring IndexPathFor(const std::string& driveId) { return JoinPath(DataDir(), L"index-" + Wide(driveId) + L".json"); }
+inline json ToJson(const Mapping& m) { return {{"id", m.id}, {"name", m.name}, {"node", m.node}, {"node_kind", m.node_kind}, {"mode", m.mode}, {"letter", Utf8(m.letter)}, {"folder", Utf8(m.folder)}, {"paused", m.paused}}; }
+inline json ToJson(const Config& c) {
+  json maps = json::array(); for (auto& m : c.maps) maps.push_back(ToJson(m));
+  return {{"url", c.url}, {"standby", c.standby}, {"email", c.email}, {"device_id", c.device_id}, {"device_name", c.device_name}, {"drives", maps}};
+}
 inline Config LoadConfig() {
-  Config c; std::string s; if (!ReadTextFile(ConfigPath(), s)) return c;
-  try { json j = json::parse(s); c.url = j.value("url", c.url); c.standby = j.value("standby", ""); c.email = j.value("email", ""); c.device_id = j.value("device_id", ""); c.device_name = j.value("device_name", "");
-    json d = j.value("drive", json::object()); c.drive_id = d.value("id", ""); c.drive_name = d.value("name", ""); c.drive_node = d.value("node", ""); c.drive_node_kind = d.value("node_kind", "");
-    c.folder = Wide(j.value("folder", "")); c.paused = j.value("paused", false); } catch (...) {}
+  Config c; std::string s;
+  if (ReadTextFile(ConfigPath(), s)) {
+    try {
+      json j = json::parse(s); c.url = j.value("url", c.url); c.standby = j.value("standby", ""); c.email = j.value("email", ""); c.device_id = j.value("device_id", ""); c.device_name = j.value("device_name", "");
+      json maps = j.value("drives", json::array());   // a named copy: iterating a temporary json dangles
+      for (auto& x : maps) {
+        Mapping m; m.id = x.value("id", ""); m.name = x.value("name", ""); m.node = x.value("node", ""); m.node_kind = x.value("node_kind", "");
+        m.mode = x.value("mode", "folder"); m.letter = Wide(x.value("letter", "")); m.folder = Wide(x.value("folder", "")); m.paused = x.value("paused", false);
+        if (!m.id.empty()) c.maps.push_back(m);
+      }
+      json d = j.value("drive", json::object());       // 0.1.0: one drive in a folder
+      if (c.maps.empty() && !d.value("id", std::string()).empty() && !j.value("folder", std::string()).empty()) {
+        Mapping m; m.id = d.value("id", ""); m.name = d.value("name", ""); m.node = d.value("node", ""); m.node_kind = d.value("node_kind", "");
+        m.mode = "folder"; m.folder = Wide(j.value("folder", "")); m.paused = j.value("paused", false);
+        c.maps.push_back(m);
+        std::wstring old = JoinPath(DataDir(), L"index.json");
+        if (FileExists(old)) MoveFileExW(old.c_str(), IndexPathFor(m.id).c_str(), MOVEFILE_REPLACE_EXISTING);
+      }
+    } catch (...) {}
+  }
   std::wstring env = EnvW(L"MINISERVER_URL"); if (!env.empty()) c.url = Utf8(env);   // the environment wins (the lab rule)
   while (!c.url.empty() && c.url.back() == '/') c.url.pop_back();
   return c;
 }
 inline bool SaveConfig(const Config& c) { return WriteTextFile(ConfigPath(), ToJson(c).dump(2)); }
+// The engine's config for one mapping: the account plus that drive.
+inline Config ForMapping(const Config& c, const Mapping& m) { Config e = c; e.maps.clear(); e.drive_id = m.id; e.drive_name = m.name; e.drive_node = m.node; e.drive_node_kind = m.node_kind; e.folder = m.folder; e.paused = m.paused; return e; }
 
 class Secrets {
  public:

@@ -18,11 +18,12 @@ namespace cd {
 
 struct IndexEntry { bool dir = false; uint64_t size = 0; int64_t mtime = 0; std::string sha256; int64_t rev = 0; };
 struct Index {
+  std::wstring path;                                 // index-<drive id>.json in the data folder
   int64_t rev = 0;                                   // the drive rev this index is in step with
   std::map<std::string, IndexEntry> files;           // drive paths ("a/b.txt")
   std::map<std::string, std::string> uploads;        // path -> upload id of a chunked upload in progress (resumed after a restart)
   bool Load() {
-    std::string s; if (!ReadTextFile(IndexPath(), s)) return false;
+    std::string s; if (!ReadTextFile(path, s)) return false;
     try { json j = json::parse(s); rev = j.value("rev", (int64_t)0);
       json files_ = j.value("files", json::object()), ups_ = j.value("uploads", json::object());   // named: items() over a temporary dangles
       for (auto& el : files_.items()) { IndexEntry e; auto& v = el.value(); e.dir = v.value("dir", false); e.size = v.value("size", (uint64_t)0); e.mtime = v.value("mtime", (int64_t)0); e.sha256 = v.value("sha256", ""); e.rev = v.value("rev", (int64_t)0); files[el.key()] = e; }
@@ -33,7 +34,7 @@ struct Index {
   bool Save() const {
     json f = json::object(); for (auto& [p, e] : files) f[p] = {{"dir", e.dir}, {"size", e.size}, {"mtime", e.mtime}, {"sha256", e.sha256}, {"rev", e.rev}};
     json u = json::object(); for (auto& [p, id] : uploads) u[p] = id;
-    return WriteTextFile(IndexPath(), json({{"rev", rev}, {"files", f}, {"uploads", u}}).dump());
+    return WriteTextFile(path, json({{"rev", rev}, {"files", f}, {"uploads", u}}).dump());
   }
 };
 
@@ -323,6 +324,7 @@ class Engine {
   void Loop() {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     m_root = m_cfg.folder; m_pc = ComputerName();
+    m_idx.path = IndexPathFor(m_cfg.drive_id);
     bool loaded = m_idx.Load();
     Log("index " + std::string(loaded ? "loaded" : "not loaded (fresh start)") + ": rev " + std::to_string(m_idx.rev) + ", " + std::to_string(m_idx.files.size()) + " entries");
     if (m_cfg.drive_id.empty() || m_root.empty() || m_cfg.device_id.empty()) { SetState("setup", "Pair this PC and pick a drive and a folder."); return; }

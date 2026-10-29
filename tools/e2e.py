@@ -27,8 +27,22 @@ def ok(c, msg):
     if not c:
         raise SystemExit(1)
 
+HOMES = {}   # data dir -> USERPROFILE for that "PC" (where a drive letter's files are kept)
+
+
+def free_letter():
+    import string, ctypes
+    used = ctypes.windll.kernel32.GetLogicalDrives()
+    for c in "YXWVUTSRQPONM":
+        if not (used >> (ord(c) - 65)) & 1:
+            return c
+    raise SystemExit("no free drive letter for the test")
+
+
 def cli(data_dir, *args, timeout=120):
     e = dict(os.environ, CHRONODRIVE_DATA=data_dir, MINISERVER_URL=B)
+    if data_dir in HOMES:
+        e["USERPROFILE"] = HOMES[data_dir]
     r = subprocess.run([CLI, *args], env=e, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace")
     return r.returncode, (r.stdout + r.stderr).strip()
 
@@ -54,6 +68,8 @@ su = r["token"]
 email = f"cdtest-{uuid.uuid4().hex[:8]}@example.com"; pw = secrets.token_urlsafe(16)
 s, r = call("POST", "/api/collections/users/records", {"email": email, "password": pw, "passwordConfirm": pw, "name": "cd test"})
 ok(s == 200, "test user"); uid = r["id"]
+s, r = call("PATCH", f"/api/collections/users/records/{uid}", {"verified": True, "approved": True}, token=su)   # the account gate: only verified + approved accounts use the API
+ok(s == 200, "test user verified and approved")
 s, r = call("POST", "/api/collections/users/auth-with-password", {"identity": email, "password": pw}); utok = r["token"]
 tmp = tempfile.mkdtemp(prefix="cdrive-")
 A, Bd = os.path.join(tmp, "pcA"), os.path.join(tmp, "pcB"); FA, FB = os.path.join(tmp, "folderA"), os.path.join(tmp, "folderB")
@@ -62,7 +78,12 @@ try:
     pair(A, utok, "PC-A"); pair(Bd, utok, "PC-B")
     rc, out = cli(A, "create", "--name", "cd test", "--node", NODE, "--size", "2")
     ok(rc == 0 and "created" in out, out[:100]); did = out.split()[1]
-    rc, out = cli(A, "use", did, "--folder", FA); ok(rc == 0, out[:80])
+    # PC A shows the drive as a drive letter (its files kept under its own USERPROFILE), PC B in a folder
+    HOMES[A] = os.path.join(tmp, "homeA"); os.makedirs(HOMES[A])
+    L = free_letter()
+    rc, out = cli(A, "use", did, "--letter", L); ok(rc == 0 and (L + ":") in out, out[:120])
+    FA = L + ":\\"
+    ok(os.path.isdir(FA), f"the drive letter {L}: exists")
     rc, out = cli(Bd, "use", did, "--folder", FB); ok(rc == 0, out[:80])
     # the node agent needs a run (30 s office, 60 s home) to make the drive root and start the service
     time.sleep(75)
@@ -92,6 +113,8 @@ try:
     ok(s == 200 and d["files"] == 3, f"the node reported the drive ({d.get('files')} files)")
     print("ALL OK (ChronoDrive end to end on node " + NODE + ")")
 finally:
+    if did and A in HOMES:
+        cli(A, "remove", did)   # the drive letter goes
     if did:
         call("DELETE", f"/api/ms/drive/drives/{did}", token=utok)
     call("DELETE", f"/api/collections/users/records/{uid}", token=su)
