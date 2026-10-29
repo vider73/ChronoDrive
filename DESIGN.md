@@ -2,7 +2,8 @@
 
 The server side (drives on node disks with the `drive` role, the drive service, grants, backups and mirrors) is
 designed and documented in the Miniserver repo: `docs/chronodrive.md` and `API.md` §17. This file is about the
-Windows client. Built 2026-10-28 (v0.1.0).
+Windows client. Built 2026-10-28 (v0.1.0: one drive in a folder); 2026-10-29 v0.2.0: every drive of the account, each as a drive
+letter or in a folder, after José found the single folder confusing.
 
 ## Pieces
 
@@ -10,10 +11,16 @@ Windows client. Built 2026-10-28 (v0.1.0).
 |---|---|
 | `msclient.hpp` | Paths, config (`config.json`), secrets (DPAPI), log; `Http()` on WinHTTP: JSON calls, bodies streamed from a file slice (chunks), responses streamed to a file (downloads with `Range`), and **certificate pinning** for home nodes (the SHA-256 of the node's certificate the Miniserver handed out, checked in the `SENDING_REQUEST` callback before any body goes); `Miniserver` (device token, primary then standby on transport failures, pairing); `DriveClient` (the drive service's API). |
 | `sync.hpp` | `Index` (what this PC last saw of every path, with the drive's rev as the base rev of the next write), the folder scanner (Windows-safe, ignores), `Engine` (the worker loop: connect, remote pass, local pass; a watcher thread on `ReadDirectoryChangesW`; a poller thread on the change feed's long poll). |
-| `main.cpp` | The tray app: one ChronoUI window (account, drive, folder, status, recent changes, log), the tray menu, pairing driven from the UI thread with async calls, autostart (HKCU Run). |
+| `drives.hpp` | `DriveSet`: one `Engine` per drive shown on this PC; drive letters (`DefineDosDevice`, what `subst` does, in the user's session, with the drive's name and icon under `HKCU\Software\Classes\Applications\Explorer.exe\Drives\<L>`), defined again at start; Remove from PC stops the engine, removes the letter and forgets the index (the files stay). |
+| `main.cpp` | The tray app: one ChronoUI window with a card per drive of the account (Show on this PC as a letter or a folder, Open, Pause, Remove from PC), pairing, recent changes; the tray menu lists the drives. One instance per data folder (`CHRONODRIVE_DATA`); `--show <id>` opens a drive's panel. |
 | `cli.cpp` | `cdrive.exe`: the same engine from a console. `cdrive sync --seconds N` is what the end-to-end test drives (`CHRONODRIVE_DATA` gives each "PC" its own data folder). |
 
 ## Decisions
+
+- **Drive letters are `subst`, not a virtual file system.** The letter points at a real folder with real files, so
+  every program works with it and nothing is fetched on demand. A placeholder drive like OneDrive's (Cloud Files API)
+  or a WinFsp file system would save disk space but is a different, much larger project; it is the natural next step
+  if drives get bigger than the PCs' disks.
 
 - **No service.** One process per signed-in user, started at logon from the tray. The drive is the user's; nothing
   needs elevation. (ChronoBackup needs a service because it backs up without a signed-in user; a drive does not.)

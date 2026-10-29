@@ -19,22 +19,23 @@ runs on the node). Build: `.\build.ps1` (CMake, VS 2022 x64, header-only ChronoU
 
 ## First run
 
-1. **Pair this PC**: the Miniserver address (default `https://cs-miniserver.chronoscan.org`; the environment
-   variable `MINISERVER_URL` wins over the saved one), then "Pair this PC": a code and the QR page open, approve it
-   with your account (`/link/`). The device credentials are kept with DPAPI (`%LOCALAPPDATA%\ChronoDrive\secrets.bin`).
-2. **Pick a drive** (or create one: name, size in GB, where: the nodes with a `drive` role you may use, with their
-   free space; optional daily backup on the node).
-3. **Pick the local folder**, then "Start syncing". The tray icon shows the state; right-click: open the folder,
-   pause, the recent changes, exit. "Start with Windows" puts it in the tray at logon (`--tray`).
+1. **Pair this PC**: press "Pair this PC"; a code opens in the browser, approve it with your account. (The server
+   address is the default; `MINISERVER_URL` wins over it.) The device key is kept with DPAPI.
+2. **Show a drive on this PC**: every drive of your account is a card. "Show on this PC" puts it here
+   **as its own drive letter** (`Z:`, with its name in Explorer; the files are kept in
+   `%USERPROFILE%\ChronoDrive\<name>`) **or in a folder** you pick. Each drive on its own: show both, or one.
+3. That's it: the card says where it is and whether it is up to date; Open / Pause / Remove from PC. New drives are
+   created on the web ("New drive…" opens `/chronodrive/` on the Miniserver). "Start with Windows" puts it in the tray
+   at logon, and it defines the drive letters again then (a letter lasts until you sign out).
 
 Same thing from a console:
 
 ```powershell
 cdrive pair
 cdrive drives
-cdrive create --name Documents --node miniserver-h1 --size 50 --backup
-cdrive use <drive id> --folder D:\Drive\Documents
-cdrive sync            # until Ctrl+C; status every 2 s, then the recent changes
+cdrive use <drive id> --letter Z          # or: --folder D:\Drive\Documents
+cdrive sync            # every drive shown here, until Ctrl+C
+cdrive remove <drive id>                  # off this PC; the files stay
 ```
 
 ## How it syncs
@@ -65,9 +66,9 @@ Miniserver repo).
 
 | Path | What |
 |---|---|
-| `%LOCALAPPDATA%\ChronoDrive\config.json` | server, account, device, drive, folder, paused |
+| `%LOCALAPPDATA%\ChronoDrive\config.json` | server, account, device, and the drives shown here (letter or folder, paused) |
 | `secrets.bin` | the device secret (DPAPI, this user) |
-| `index.json` | the sync index (deleted when the drive or the folder changes: a fresh start) |
+| `index-<drive id>.json` | the sync index of each drive (forgotten when the drive is removed from this PC) |
 | `logs\chronodrive.log` | what happened (rotated at 2 MB) |
 
 `CHRONODRIVE_DATA=<folder>` moves all of that (two instances on one PC, tests).
