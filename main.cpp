@@ -8,6 +8,7 @@
 #include <memory>
 #include "drives.hpp"
 #include "updater.hpp"
+#include "hubpipe.hpp"
 #include "VirtualWidget.hpp"
 #include "VirtualChat.hpp"
 #include "VControls.hpp"
@@ -22,6 +23,7 @@ using cd::json;
 
 constexpr UINT WM_APP_RESULT = WM_APP + 1;
 constexpr UINT WM_APP_TRAY = WM_APP + 3;
+constexpr UINT WM_APP_HUB = WM_APP + 4;      // a command from ChronoScan Tools (hubpipe.hpp): lparam = json*
 constexpr UINT kTrayId = 1;
 constexpr int kMaxCards = 6;
 enum { kMenuOpen = 101, kMenuPause = 103, kMenuPage = 104, kMenuUpdate = 105, kMenuExit = 109, kMenuDrive = 200 };
@@ -132,7 +134,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   win.SetBackground(vtheme::Current().window);
   g_hwnd = win.GetHWND();
   auto repaint = [] { InvalidateRect(g_hwnd, nullptr, FALSE); };
-  Tray tray; tray.Add(g_hwnd, hInstance);
+  // While ChronoScan Tools runs it shows the drives in its own icon: ours stays away (checked again every second).
+  Tray tray; if (!cd::hub::HubRunning()) tray.Add(g_hwnd, hInstance);
+  cd::hub::Server hubPipe; hubPipe.Start(cd::hub::PipeName(inst), [](const json& req) { PostMessageW(g_hwnd, WM_APP_HUB, 0, (LPARAM)new json(req)); });
   auto showWindow = [&] { ShowWindow(g_hwnd, SW_SHOW); if (IsIconic(g_hwnd)) ShowWindow(g_hwnd, SW_RESTORE); SetForegroundWindow(g_hwnd); };
 
   // ---- state
@@ -287,8 +291,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     }
     mapHint->Text(letter ? L"Its own disk in Explorer. The files are kept in " + cd::BackingFolder(driveName(mapId)) + L"."
                          : L"The folder gets the drive's files and stays in step with it.");
-    // tray and recent changes
+    // tray, the hub's picture and recent changes
     std::string all = set.Overall();
+    {
+      json ds = json::array();
+      for (auto& m : cfg.maps) {
+        auto st = set.Status(m.id); bool run = set.Running(m.id);
+        ds.push_back({{"id", m.id}, {"name", m.name}, {"at", U(cd::ShownAt(m))}, {"state", run ? st.state : "error"}, {"detail", run ? st.detail : "not syncing"}, {"pending", st.pending}, {"paused", m.paused}});
+      }
+      hubPipe.Publish({{"version", CD_VERSION_STR}, {"paired", linked()}, {"email", cfg.email}, {"overall", cfg.maps.empty() ? "setup" : all}, {"drives", ds}});
+    }
     tray.Tip(cfg.maps.empty() ? L"ChronoDrive" : all == "idle" ? L"ChronoDrive \x2014 up to date" : all == "syncing" ? L"ChronoDrive \x2014 syncing" : all == "offline" ? L"ChronoDrive \x2014 waiting for a drive" : L"ChronoDrive \x2014 " + W(all));
     std::vector<std::pair<time_t, std::wstring>> rs;
     for (auto& m : cfg.maps) for (auto& r : set.Status(m.id).recent) rs.push_back({r.at, W(cd::TimeLocal(r.at)) + L"    " + W(m.name) + L"    " + W(r.what) + L"   " + W(r.path)});
@@ -559,12 +571,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
       for (;;) { std::unique_ptr<AsyncResult> r; { std::lock_guard<std::mutex> lk(g_amx); if (g_aq.empty()) break; r = std::move(g_aq.front()); g_aq.pop_front(); } try { if (r->cb) r->cb(r->r, r->err); } catch (std::exception& e) { showMsg(L"Unexpected error", W(e.what())); } }
       return true;
     }
+    if (msg == WM_APP_HUB) {
+      std::unique_ptr<json> req((json*)lp); std::string cmd = req->value("cmd", "");
+      if (cmd == "pause") { bool on = req->value("on", true); for (auto& x : cfg.maps) set.Pause(x.id, on); cd::SaveConfig(cfg); fill(); repaint(); }
+      else if (cmd == "sync") { loadDrives(); set.KickAll(); }
+      else if (cmd == "show") showWindow();
+      return true;
+    }
     return false;
   });
   win.OnTick([&](float dt) {
     tick += dt; tick30 += dt;
     if (tick >= 1.0f) {
-      tick = 0; fill(); repaint();
+      tick = 0;
+      bool hub = cd::hub::HubRunning();
+      if (hub && tray.added) tray.Remove(); else if (!hub && !tray.added) tray.Add(g_hwnd, hInstance);
+      fill(); repaint();
       if (!linkCode.empty() && !busy) {
         busy = true; std::string url = linkUrl, code = linkCode, secret = linkSecret;
         Async([url, code, secret](std::string& err) { std::string st; json p = cd::Miniserver::LinkPoll(url, code, secret, st, err); if (p.is_null()) p = json::object(); p["_status"] = st;

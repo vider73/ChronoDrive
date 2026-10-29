@@ -31,7 +31,7 @@ message(STATUS "ChronoDrive version ${CD_VERSION}")
 set(CD_INC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/third_party ${CMAKE_BINARY_DIR})
 
 # The ChronoUI app (tray + window). NOMINMAX is not defined (the framework wraps std::max itself).
-add_executable(ChronoDrive WIN32 main.cpp msclient.hpp sync.hpp app.rc ${CMAKE_BINARY_DIR}/version.h)
+add_executable(ChronoDrive WIN32 main.cpp msclient.hpp sync.hpp hubpipe.hpp app.rc ${CMAKE_BINARY_DIR}/version.h)
 target_include_directories(ChronoDrive PRIVATE ${CHRONOUI_ROOT}/include ${CD_INC})
 target_compile_definitions(ChronoDrive PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS _WIN32_WINNT=0x0A00)
 target_link_libraries(ChronoDrive PRIVATE d2d1 dwrite windowscodecs shlwapi shell32 ole32 uuid winhttp crypt32 advapi32)
