@@ -7,6 +7,7 @@
 #include <deque>
 #include <memory>
 #include "drives.hpp"
+#include "updater.hpp"
 #include "VirtualWidget.hpp"
 #include "VirtualChat.hpp"
 #include "VControls.hpp"
@@ -23,7 +24,7 @@ constexpr UINT WM_APP_RESULT = WM_APP + 1;
 constexpr UINT WM_APP_TRAY = WM_APP + 3;
 constexpr UINT kTrayId = 1;
 constexpr int kMaxCards = 6;
-enum { kMenuOpen = 101, kMenuPause = 103, kMenuPage = 104, kMenuExit = 109, kMenuDrive = 200 };
+enum { kMenuOpen = 101, kMenuPause = 103, kMenuPage = 104, kMenuUpdate = 105, kMenuExit = 109, kMenuDrive = 200 };
 
 static const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static std::wstring ExePathW() { wchar_t b[MAX_PATH * 2]; GetModuleFileNameW(nullptr, b, MAX_PATH * 2); return b; }
@@ -113,9 +114,9 @@ class VLines : public VirtualWidgetImpl {
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   lockDpiAwareness();
-  bool trayStart = false; std::string showId;   // --show <drive id>: open that drive's "show on this PC" panel
+  bool trayStart = false, justUpdated = false; std::string showId;   // --show <drive id>: open that drive's "show on this PC" panel; --updated: the setup restarted us
   { int argc = 0; LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    for (int i = 1; argv && i < argc; ++i) { if (!wcscmp(argv[i], L"--tray")) trayStart = true; else if (!wcscmp(argv[i], L"--show") && i + 1 < argc) showId = cd::Utf8(argv[++i]); }
+    for (int i = 1; argv && i < argc; ++i) { if (!wcscmp(argv[i], L"--tray")) trayStart = true; else if (!wcscmp(argv[i], L"--show") && i + 1 < argc) showId = cd::Utf8(argv[++i]); else if (!wcscmp(argv[i], L"--updated")) justUpdated = true; }
     if (argv) LocalFree(argv); }
   // One instance per data folder: CHRONODRIVE_DATA (tests, a second account) gets its own lock and its own "show" message.
   std::wstring inst = cd::EnvW(L"CHRONODRIVE_DATA"); for (auto& c : inst) if (c == L'\\' || c == L':' || c == L'/') c = L'_';
@@ -138,6 +139,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   cd::DriveSet set(cfg, sec.Get("device_secret"));
   json drives = json::array();                    // the account's drives (from the Miniserver)
   std::string linkCode, linkSecret, linkUrl, mapId, serverNote; bool busy = false, loaded = false; float tick = 0.9f, tick30 = 0;
+  // updates (updater.hpp): checked 1 minute after start and every 6 hours; a newer setup is downloaded and verified in
+  // the background, and installed when every drive is up to date (the setup closes this app and starts it again)
+  std::string updNote = justUpdated ? std::string("Updated to ") + CD_VERSION_STR : ""; std::wstring updSetup; std::string updVersion; bool updBusy = false; float updTick = 6 * 3600 - 60;
   auto linked = [&] { return !cfg.device_id.empty() && !sec.Get("device_secret").empty(); };
 
   auto* msgDlg = win.AddChrome<VDialog>(); msgDlg->Attach(&win); msgDlg->Primary(L"OK");
@@ -245,7 +249,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     std::sort(rs.begin(), rs.end(), [](auto& a, auto& b) { return a.first > b.first; });
     std::vector<std::wstring> lines; for (size_t i = 0; i < rs.size() && i < 8; ++i) lines.push_back(rs[i].second);
     recent->Lines(lines);
-    footer->Text(serverNote.empty() ? W(cfg.url) : W(serverNote));
+    footer->Text(!serverNote.empty() ? W(serverNote) : !updNote.empty() ? W(updNote) : L"ChronoDrive " CD_VERSION_WSTR);
     if (relayout) relayout();
   };
 
@@ -260,6 +264,40 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         for (auto& m : cfg.maps) for (auto& d : drives) if (d.value("id", "") == m.id) { m.name = d.value("name", m.name); m.node = d.value("node", m.node); m.node_kind = d.value("node_kind", m.node_kind); }
         cd::SaveConfig(cfg); fill(); repaint();
       });
+  };
+
+  std::function<void(bool)> checkUpdate = [&](bool manual) {
+    if (updBusy || !updSetup.empty()) return;
+    updBusy = true; if (manual) { updNote = "Checking for updates\xe2\x80\xa6"; fill(); repaint(); }
+    cd::Config c = cfg; std::string secret = sec.Get("device_secret"); bool paired = linked();
+    Async([c, secret, paired](std::string& err) -> json {
+      cd::Miniserver ms(c.url, c.standby, c.device_id, secret);
+      cd::upd::Info i = cd::upd::Check(ms, CD_VERSION_STR);
+      if (!i.error.empty()) { err = i.error; return json(); }
+      json out = {{"available", i.available}, {"version", i.version}};
+      if (i.available && paired) {
+        std::wstring setup; std::string e = cd::upd::Download(ms, i, setup);
+        if (!e.empty()) { err = e; return out; }
+        out["setup"] = cd::Utf8(setup);
+      }
+      return out; },
+      [&, manual](const json& r, const std::string& err) {
+        updBusy = false;
+        if (!err.empty()) { cd::Log("update: " + err); if (manual) updNote = "Update check failed: " + err; fill(); repaint(); return; }
+        if (!r.value("available", false)) { if (manual) updNote = "ChronoDrive " CD_VERSION_STR " is up to date"; fill(); repaint(); return; }
+        updVersion = r.value("version", "");
+        if (r.contains("setup")) { updSetup = cd::Wide(r.value("setup", "")); updNote = "Version " + updVersion + " is ready: it installs when every drive is up to date"; cd::Log("update: " + updVersion + " downloaded and verified"); }
+        else updNote = "Version " + updVersion + " is available on the ChronoDrive page";
+        fill(); repaint();
+      });
+  };
+  auto installIfReady = [&] {
+    if (updSetup.empty()) return;
+    std::string all = set.Overall();
+    if (all != "idle" && all != "setup" && all != "offline" && all != "paused") return;   // never in the middle of a sync
+    std::string e = cd::upd::Install(updSetup);
+    if (!e.empty()) { cd::Log("update: " + e); updNote = "Update " + updVersion + " failed: " + e; updSetup.clear(); fill(); repaint(); return; }
+    tray.Remove(); ExitProcess(0);   // the setup replaces us now (see updater.hpp)
   };
 
   auto openMap = [&](const std::string& id) {
@@ -375,10 +413,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   win.OnResize([&] { layout(); repaint(); });
   if (linked()) { auto notes = set.StartAll(); cd::SaveConfig(cfg); if (!notes.empty()) serverNote = notes[0]; }
   fill(); loadDrives();
+  cd::upd::CleanOld(CD_VERSION_STR);
 
-  win.OnMessage([&](UINT msg, WPARAM, LPARAM lp) -> bool {
+  win.OnMessage([&](UINT msg, WPARAM wp, LPARAM lp) -> bool {
     if (msg == WM_SHOWME) { showWindow(); return true; }
     if (msg == WM_CLOSE) { ShowWindow(g_hwnd, SW_HIDE); return true; }
+    // Windows signing out, or a setup's Restart Manager closing us to replace the files (WM_QUERYENDSESSION is left to
+    // the default answer, yes): end at once
+    if (msg == WM_ENDSESSION) { if (wp) { tray.Remove(); ExitProcess(0); } return true; }
     if (msg == WM_APP_TRAY) {
       UINT ev = LOWORD(lp);
       if (ev == WM_LBUTTONUP || ev == WM_LBUTTONDBLCLK || ev == NIN_SELECT || ev == NIN_KEYSELECT) { showWindow(); return true; }
@@ -391,6 +433,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         bool anyRunning = false; for (auto& x : cfg.maps) if (!x.paused) anyRunning = true;
         AppendMenuW(m, MF_STRING | (cfg.maps.empty() ? MF_GRAYED : 0), kMenuPause, anyRunning ? L"Pause all" : L"Resume all");
         AppendMenuW(m, MF_STRING, kMenuPage, L"Your drives on the Miniserver");
+        AppendMenuW(m, MF_STRING | (updBusy ? MF_GRAYED : 0), kMenuUpdate, updSetup.empty() ? L"Check for updates" : (L"Install version " + W(updVersion) + L" now").c_str());
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(m, MF_STRING, kMenuExit, L"Exit (syncing stops)");
         POINT pt; GetCursorPos(&pt); SetForegroundWindow(g_hwnd);
@@ -400,6 +443,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         else if (cmd >= kMenuDrive && cmd < kMenuDrive + 20 && (size_t)(cmd - kMenuDrive) < cfg.maps.size()) { auto& x = cfg.maps[(size_t)(cmd - kMenuDrive)]; OpenPath(cd::ShownAt(x) + (x.mode == "letter" ? L"\\" : L"")); }
         else if (cmd == kMenuPause) { for (auto& x : cfg.maps) set.Pause(x.id, anyRunning); cd::SaveConfig(cfg); fill(); }
         else if (cmd == kMenuPage) OpenPath(W(cfg.url + "/chronodrive/#mine"));
+        else if (cmd == kMenuUpdate) { if (updSetup.empty()) checkUpdate(true); else { std::string e = cd::upd::Install(updSetup); if (e.empty()) { tray.Remove(); ExitProcess(0); } else { updNote = "Update failed: " + e; fill(); } } }
         else if (cmd == kMenuExit) { tray.Remove(); PostQuitMessage(0); }
       }
       return true;
@@ -432,14 +476,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         });
       }
     }
-    if (tick30 >= 30.0f) { tick30 = 0; loadDrives(); }
+    if (tick30 >= 30.0f) { tick30 = 0; loadDrives(); installIfReady(); }
+    updTick += dt; if (updTick >= 6 * 3600) { updTick = 0; checkUpdate(false); }
     if (!openMapLater.empty()) { std::string id = openMapLater; openMapLater.clear(); openMap(id); }
   });
   int rc = win.RunMessageLoop();
-  set.StopAll();
   tray.Remove();
   if (single) CloseHandle(single);
-  CoUninitialize();
+  ExitProcess((UINT)rc);   // not set.StopAll(): a sync thread may be in a 30 s long poll; the indexes are already saved
   return rc;
   } catch (std::exception& e) {
     std::string m = std::string("ChronoDrive stopped: ") + e.what(); cd::Log(m);

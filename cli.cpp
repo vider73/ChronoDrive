@@ -6,9 +6,11 @@
 //   cdrive use <drive id> (--letter Z | --folder <path>)       show a drive on this PC as a drive letter or in a folder
 //   cdrive remove <drive id>                                   take it off this PC (the files stay)
 //   cdrive sync [--seconds <n>]                                sync every drive shown here (until Ctrl+C, or n seconds)
+//   cdrive update [--install]                                  is there a newer ChronoDrive? download and verify it (and install it)
 //   cdrive status                                              the configuration and the index summary
 //   cdrive log [n]                                             the last n lines of the log
 #include "drives.hpp"
+#include "updater.hpp"
 #include <shellapi.h>
 #include <iostream>
 #include "version.h"
@@ -58,6 +60,18 @@ int wmain(int argc, wchar_t** argv) {
   }
   Miniserver ms(cfg.url, cfg.standby, cfg.device_id, sec.Get("device_secret"));
   if (!ms.Linked()) { out("not paired: cdrive pair"); return 1; }
+  if (cmd == "update") {
+    upd::Info i = upd::Check(ms, CD_VERSION_STR);
+    if (!i.error.empty()) { out("check: " + i.error); return 1; }
+    out("running " CD_VERSION_STR ", published " + i.version + (i.available ? "  -> newer" : "  -> up to date"));
+    if (!i.available && !Flag(argc, argv, L"--force")) return 0;
+    std::wstring setup; std::string e = upd::Download(ms, i, setup);
+    if (!e.empty()) { out("download: " + e); return 1; }
+    out("downloaded and verified (sha256 + ChronoScan signature): " + Utf8(setup));
+    if (!Flag(argc, argv, L"--install")) return 0;
+    e = upd::Install(setup); if (!e.empty()) { out("install: " + e); return 1; }
+    out("setup started"); return 0;
+  }
   if (cmd == "drives") {
     std::string err; json d = ms.Json(L"GET", "/api/ms/drive/drives", nullptr, err);
     if (d.is_null()) { out("drives: " + err); return 1; }
@@ -114,5 +128,5 @@ int wmain(int argc, wchar_t** argv) {
     set.StopAll();
     return err ? 1 : 0;
   }
-  out("cdrive " CD_VERSION_STR ": pair | unlink | drives | create | use | remove | sync | status | log"); return 2;
+  out("cdrive " CD_VERSION_STR ": pair | unlink | drives | create | use | remove | sync | update | status | log"); return 2;
 }

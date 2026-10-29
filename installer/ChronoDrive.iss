@@ -1,6 +1,6 @@
 ; ChronoDrive installer (Inno Setup 6). The version below is the ONLY place it lives: CMake reads it.
 #define AppName "ChronoDrive"
-#define AppVersion "0.2.0"
+#define AppVersion "0.2.1"
 #define Root ".."
 #ifndef BUILDDIR
 #define BUILDDIR "build\Release"
@@ -42,3 +42,8 @@ Name: "{autoprograms}\ChronoDrive"; Filename: "{app}\ChronoDrive.exe"
 
 [Run]
 Filename: "{app}\ChronoDrive.exe"; Description: "Open ChronoDrive"; Flags: postinstall nowait skipifsilent
+; an update the app started itself (/UPDATEFROM=app, silent): it comes back to the tray
+Filename: "{app}\ChronoDrive.exe"; Parameters: "--tray --updated"; Flags: nowait; Check: IsAppUpdate
+
+[Code]
+function IsAppUpdate(): Boolean; begin Result := ExpandConstant('{param:UPDATEFROM|}') = 'app'; end;

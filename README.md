@@ -62,6 +62,16 @@ encryption, a version history in the client (the drive's restic backup on the no
 a relay for home drives from the Internet, bandwidth limits (see `docs/chronodrive.md` section 3.4 in the
 Miniserver repo).
 
+## Updates
+
+ChronoDrive updates itself, like ChronoRemote: a minute after it starts and every 6 hours it reads
+`<server>/chronodrive/windows.json`; when a newer version is published it downloads the setup with this PC's device
+token, checks the SHA-256 the server announced and ChronoScan's code signature, waits until every drive is up to date,
+and runs the setup silently (`/UPDATEFROM=app`): the setup closes the app, installs over it and starts it again in the
+tray ("Updated to 0.2.x" at the bottom of the window). No administrator rights. The tray menu has "Check for updates"
+(and "Install version x now" once one is downloaded); `cdrive update [--install]` does the same from a console.
+Publishing a version: `toolsuild_setup.ps1` then `tools\publish_setup.ps1 -Notes "..."`.
+
 ## Files on this PC
 
 | Path | What |
@@ -70,5 +80,6 @@ Miniserver repo).
 | `secrets.bin` | the device secret (DPAPI, this user) |
 | `index-<drive id>.json` | the sync index of each drive (forgotten when the drive is removed from this PC) |
 | `logs\chronodrive.log` | what happened (rotated at 2 MB) |
+| `updates\` | the last setup downloaded by the updater (older ones are deleted at start) |
 
 `CHRONODRIVE_DATA=<folder>` moves all of that (two instances on one PC, tests).
