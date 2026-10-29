@@ -3,3 +3,5 @@ build-*/
 installer/Output/
 *.user
 .vs/
+__pycache__/
+*.pyc
