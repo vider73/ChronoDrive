@@ -1,0 +1,14 @@
+[Unit]
+Description=ChronoDrive: keeps the mounted drives in sync with the Miniserver
+Documentation=file://@DEST@/README.md
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 @DEST@/chronodrive service
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

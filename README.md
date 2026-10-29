@@ -38,6 +38,13 @@ cdrive sync            # every drive shown here, until Ctrl+C
 cdrive remove <drive id>                  # off this PC; the files stay
 ```
 
+## Linux
+
+`linux/` is the Linux client: a console program plus a `systemd --user` service, Python standard library only, same
+protocol and sync rules, so Linux and Windows PCs share a drive. Install from a clone with `./linux/install.sh`, then
+`chronodrive pair`, `chronodrive drives`, `chronodrive mount <drive> [folder]`. A drive is a folder there
+(`~/ChronoDrive/<name>` by default); names Windows refuses are skipped and reported. Details: [linux/README.md](linux/README.md).
+
 ## How it syncs
 
 - The drive is reachable at the node's own address: on the LAN of a home node (`https://<lan ip>:8443/drive/<id>`,
