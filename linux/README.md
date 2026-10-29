@@ -26,7 +26,7 @@ Keep the checkout: `chronodrive update` pulls it and reinstalls.
 
 ```bash
 chronodrive pair                     # shows a code and a QR: scan it with your phone (or open the link), Approve
-chronodrive drives                   # your drives: size, used, node, reachable from here, where mounted
+chronodrive drives                   # your drives and those shared with you: size, used, node, reachable, where mounted
 chronodrive mount Documents          # syncs it in ~/ChronoDrive/Documents
 chronodrive mount Fotos ~/Pictures/Fotos   # or in a folder you pick
 chronodrive status                   # service, each drive: up to date?, last sync, files, what is not synced
@@ -45,6 +45,22 @@ That's all: the service keeps every mounted drive in sync from then on. Other co
 
 `<drive>` is the drive's name, its id, or a unique start of either. New drives are created on the web:
 `<server>/chronodrive/`.
+
+## Sharing
+
+A drive can be shared with other Miniserver accounts (they need an account; it shows in their list at once, and the
+space counts for the owner):
+
+```bash
+chronodrive share Documents ana@example.com          # Ana can edit
+chronodrive share Documents ana@example.com --read   # Ana can only read
+chronodrive unshare Documents ana@example.com
+chronodrive leave "Fotos de Ana"                     # leave a drive shared with you (unmounted here; the files stay)
+```
+
+`chronodrive drives` shows who a drive is shared with, or `shared by <owner> (read only)`. A **read-only** drive is
+a download-only copy: files deleted here come back from the drive, files new or changed here stay on this PC and are
+not uploaded (`status` counts them), and when the drive changes one of them yours is kept as a conflict copy.
 
 Server: `MINISERVER_URL` (environment) > the one saved by `chronodrive pair --url ...` > `https://cs-miniserver.chronoscan.org`.
 If the primary does not answer, the client retries on the standby; while the Miniserver is down a drive keeps
@@ -79,7 +95,7 @@ ago waits for the next pass.
 ## Not supported
 
 No files on demand (every file is a real local copy), no selective sync, no file permissions, owners or extended
-attributes (only content and modification time), no symbolic links, no sharing a drive between accounts, no
+attributes (only content and modification time), no symbolic links, no
 client-side encryption, no version history in the client (the drive's backup on the node is the history), no
 bandwidth limits. A drive is a folder, not a block device: "mount" means "keep this folder in sync".
 
@@ -111,4 +127,5 @@ Your synced folders are never deleted.
   the drive service), `sync.py` (index and engine), `local.py` (scan, Windows-name rules, trash), `qr.py`
   (terminal QR), `cli.py` (commands, menu, service).
 - Contract: the Miniserver's `pb_public/API.md` sections 2 (pairing), 11 (standby, nearby, home nodes) and 17 (drives).
-- End-to-end test with a Windows PC on the same drive (run on Windows, uses WSL): `python linux\tools\e2e_wsl.py [node] [--installed]`.
+- End-to-end tests (run on Windows, use WSL): `python linux\tools\e2e_wsl.py [node] [--installed]` (a Windows PC
+  on the same drive) and `python linux\tools\e2e_share.py [node] [--installed]` (sharing, read only, leave).

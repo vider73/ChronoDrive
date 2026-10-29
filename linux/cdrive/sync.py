@@ -173,7 +173,8 @@ class Engine:
         self.threads, self.watcher, self.lockf = [], None, None
         self.recent = collections.deque(maxlen=20)
         self.skipped, self.status_at = [], 0.0
-        self.st = {"state": "setup", "detail": "", "node_url": "", "pending": 0, "done": 0, "total": 0, "last_sync": 0}
+        self.st = {"state": "setup", "detail": "", "node_url": "", "pending": 0, "done": 0, "total": 0, "last_sync": 0,
+                   "read_only": False, "local_only": 0}
 
     # ---- status (status-<drive>.json: what `chronodrive status` shows while the service runs)
     def set_state(self, state, detail=""):
@@ -233,6 +234,11 @@ class Engine:
             try:
                 g, cands = grant_for(self.ms, self.id, self.device)
                 self.cands, self.grant_exp, self.url_check = cands, int(g.get("exp") or 0), now
+                # a read-only member's grant has six parts, <id>.<user>.<device>.<exp>.r.<sig> (API.md section 17 "Sharing")
+                ro = g.get("grant", "").count(".") == 5
+                if ro != self.st["read_only"]:
+                    log(f"[{self.name}] " + ("shared with this account to read only: nothing goes up" if ro else "writable"))
+                self.st["read_only"] = ro
             except Revoked:
                 raise Fatal("This PC was unlinked on the Miniserver: run 'chronodrive pair' again.")
             except HttpError as e:
@@ -461,6 +467,42 @@ class Engine:
         if fresh:
             self.again = True
 
+    def keep_read_only(self):
+        """A drive shared to read only: nothing goes up. Files deleted here come back from the drive; files new or
+        changed here stay on this PC (counted in the status), and a later change on the drive keeps them as conflict
+        copies (apply). Like the Windows client's KeepReadOnly."""
+        files, skipped = local.scan(self.root, set(self.idx.files))
+        self.report_skipped(skipped)
+        seen, local_only = set(), 0
+        for f in files:
+            seen.add(f.path)
+            ie = self.idx.files.get(f.path)
+            if not f.dir and (not ie or ie["dir"] or ie["size"] != f.size or ie["mtime"] // 1000 != f.mtime // 1000):
+                local_only += 1
+        held = [p for p, _ in skipped]
+        missing = [p for p in self.idx.files if p not in seen and not local.ignored(p.rsplit("/", 1)[-1])
+                   and not any(local.under(p, h) for h in held)]
+        for p in sorted(missing, key=len):   # folders before their files
+            if not self.running:
+                raise Stopped()
+            ie = self.idx.files.get(p)
+            if not ie:
+                continue
+            if ie["dir"]:
+                os.makedirs(os.path.join(self.root, p), exist_ok=True)
+                continue
+            e = {"path": p, "rev": ie["rev"], "kind": "file", "size": ie["size"], "mtime": ie["mtime"], "sha256": ie["sha256"]}
+            self.idx.drop(p)
+            self.apply(e)   # downloads it again
+        if local_only != self.st["local_only"] and local_only:
+            log(f"[{self.name}] read only: {local_only} file(s) new or changed here stay on this PC (not uploaded)")
+        self.st["local_only"] = local_only
+        if self.watcher:
+            self.watcher.add(self.root)
+            for f in files:
+                if f.dir:
+                    self.watcher.add(os.path.join(self.root, f.path))
+
     def report_skipped(self, skipped):
         old = {p for p, _ in self.skipped}
         for p, why in skipped:
@@ -543,9 +585,18 @@ class Engine:
         self.again = False
         try:
             self.pull_remote()
-            self.push_local()
+            if self.st["read_only"]:
+                self.keep_read_only()
+            else:
+                self.push_local()
         finally:
             self.idx.save()
+
+    def idle_text(self):
+        if not self.st["read_only"]:
+            return "Up to date"
+        n = self.st["local_only"]
+        return "Up to date (read only" + (f"; {n} local change{'s' if n != 1 else ''} not uploaded)" if n else ")")
 
     # ---- foreground: passes until up to date (sync --once)
     def run_once(self):
@@ -562,7 +613,7 @@ class Engine:
                     break
                 time.sleep(FRESH + 1)
             self.st.update(last_sync=time.time(), pending=0, done=0, total=0)
-            self.set_state("idle", "Up to date")
+            self.set_state("idle", self.idle_text())
             return ""
         except Fatal as e:
             self.set_state("error", str(e))
@@ -648,7 +699,7 @@ class Engine:
                 continue
             backoff = 30
             self.st.update(last_sync=time.time(), pending=0, done=0, total=0)
-            self.set_state("idle", "Up to date")
+            self.set_state("idle", self.idle_text())
             last_full = time.time()
             # wait for the watcher (2 s of quiet after the last event), the poller, a re-pass, or the full scan
             interval = FULL_SCAN if self.watcher.ok else FULL_SCAN_NO_WATCH

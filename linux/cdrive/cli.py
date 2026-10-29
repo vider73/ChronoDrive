@@ -2,9 +2,12 @@
 
   chronodrive                       a menu (in a terminal)
   chronodrive pair [--url U] [--name N] [--no-qr]   pair this PC with a Miniserver account (code + QR, waits)
-  chronodrive drives                the account's drives: size, used, node, reachable from here, mounted where
+  chronodrive drives                the account's drives and those shared with it: size, used, node, reachable, mounted where
   chronodrive mount <drive> [folder]   keep a drive in sync in a folder (default ~/ChronoDrive/<name>)
   chronodrive unmount <drive>       stop syncing it here (the files stay)
+  chronodrive share <drive> <email> [--read]   share your drive with another account (can edit, or read only)
+  chronodrive unshare <drive> <email>          stop sharing it with that account
+  chronodrive leave <drive>         leave a drive somebody shared with you (unmounted here; the files stay)
   chronodrive status                account, service, every mounted drive (state, last sync, what is not synced)
   chronodrive sync [--once] [--seconds N] [drive]   sync in the foreground (until Ctrl+C, N seconds, or one pass)
   chronodrive unlink                forget the account on this PC (the files stay)
@@ -236,8 +239,69 @@ def cmd_drives(cfg, args):
         m = cfg.find(d["id"])
         state = "deleting" if d.get("deleting") else ("disabled" if d.get("enabled") is False else "")
         rows.append([d.get("name", ""), f"{d.get('size_gb', 0)} GB", human(d.get("used", 0)), f"{d.get('node', '')} ({d.get('node_kind', '')})",
-                     state or rch, short_home(m["folder"]) if m else "-", d["id"]])
-    table(rows, ["NAME", "SIZE", "USED", "NODE", "REACHABLE", "MOUNTED AT", "ID"])
+                     state or rch, short_home(m["folder"]) if m else "-", sharing(d), d["id"]])
+    table(rows, ["NAME", "SIZE", "USED", "NODE", "REACHABLE", "MOUNTED AT", "SHARING", "ID"])
+    return 0
+
+
+def sharing(d):
+    """'shared by x (read only)' for a drive shared with this account, 'with a, b (read)' for an own shared one."""
+    if d.get("owner") is False:
+        return f"shared by {d.get('owner_email', '?')}" + (" (read only)" if d.get("role") == "read" else " (can edit)")
+    ms = d.get("members") or []
+    return ("with " + ", ".join(m.get("email", "?") + (" (read)" if m.get("role") == "read" else "") for m in ms)) if ms else "-"
+
+
+def owned_drive(ms, key):
+    d = find_drive(ms.json("GET", "/api/ms/drive/drives").get("drives", []), key)
+    if d.get("owner") is False:
+        raise Fail(f"{d['name']} is {d.get('owner_email', 'somebody else')}'s: only the owner shares it")
+    return d
+
+
+@guard
+def cmd_share(cfg, args):
+    read = flag(args, "--read")
+    if len(args) < 2:
+        raise Fail("usage: chronodrive share <drive> <email> [--read]")
+    ms = linked_ms(cfg)
+    d = owned_drive(ms, args[0])
+    m = ms.json("POST", f"/api/ms/drive/drives/{d['id']}/members", {"email": args[1], "role": "read" if read else "write"})
+    out(f"{d['name']} shared with {m.get('email', args[1])}" + (" (read only)." if m.get("role") == "read" else " (can edit)."))
+    return 0
+
+
+@guard
+def cmd_unshare(cfg, args):
+    if len(args) < 2:
+        raise Fail("usage: chronodrive unshare <drive> <email>")
+    ms = linked_ms(cfg)
+    d = owned_drive(ms, args[0])
+    members = ms.json("GET", f"/api/ms/drive/drives/{d['id']}/members").get("members", [])
+    who = [m for m in members if m.get("email", "").lower() == args[1].lower() or m.get("user") == args[1]]
+    if not who:
+        raise Fail(f"{d['name']} is not shared with {args[1]}")
+    ms.json("DELETE", f"/api/ms/drive/drives/{d['id']}/members/{who[0]['user']}")
+    out(f"{d['name']} is no longer shared with {who[0].get('email', args[1])}.")
+    return 0
+
+
+@guard
+def cmd_leave(cfg, args):
+    if not args:
+        raise Fail("usage: chronodrive leave <drive>")
+    ms = linked_ms(cfg)
+    d = find_drive(ms.json("GET", "/api/ms/drive/drives").get("drives", []), args[0])
+    if d.get("owner") is not False:
+        raise Fail(f"{d['name']} is yours: delete it on the web, or unmount it here")
+    ms.json("DELETE", f"/api/ms/drive/drives/{d['id']}/members/me")
+    m = cfg.find(d["id"])
+    if m:
+        cfg.drives = [x for x in cfg.drives if x["id"] != d["id"]]
+        cfg.save()
+        forget_drive_state(d["id"])
+        kick_service()
+    out(f"You left {d['name']} ({d.get('owner_email', '')})." + (f" It is no longer synced here; the files stay in {short_home(m['folder'])}." if m else ""))
     return 0
 
 
@@ -268,9 +332,14 @@ def cmd_mount(cfg, args):
         raise Fail(f"{short_home(folder)} is a file")
     busy = os.path.isdir(folder) and any(True for _ in os.scandir(folder))
     os.makedirs(folder, exist_ok=True)
-    cfg.drives.append({"id": d["id"], "name": d.get("name", ""), "node": d.get("node", ""), "node_kind": d.get("node_kind", ""), "folder": folder})
+    entry = {"id": d["id"], "name": d.get("name", ""), "node": d.get("node", ""), "node_kind": d.get("node_kind", ""), "folder": folder}
+    if d.get("owner") is False:
+        entry.update(owner_email=d.get("owner_email", ""), role=d.get("role", "write"))
+    cfg.drives.append(entry)
     cfg.save()
     out(f"Mounted {d['name']} at {short_home(folder)}.")
+    if d.get("owner") is False and d.get("role") == "read":
+        out(f"It is shared with you to read only ({d.get('owner_email', '')}): changes made here stay on this PC and are not uploaded.")
     if busy:
         out("The folder is not empty: its files are merged with the drive (a different file with the same name is kept as a conflict copy).")
     if service_state() == "running":
@@ -310,7 +379,8 @@ def drive_status_lines(d, verbose=True):
         what = "not running (last sync up to date)"
     else:
         what = f"not running (last: {st.get('detail') or state})"
-    lines = [f"{d['name']}  ->  {short_home(d['folder'])}",
+    tags = ([f"shared by {d['owner_email']}"] if d.get("owner_email") else []) + (["read only"] if st.get("read_only", d.get("role") == "read") else [])
+    lines = [f"{d['name']}  ->  {short_home(d['folder'])}" + (f"  ({', '.join(tags)})" if tags else ""),
              f"  {what}  |  last sync {common.ago(st.get('last_sync'))}  |  {len(files)} files, {human(sum(e.get('size', 0) for e in files))}, rev {idx.get('rev', 0)}"]
     if st.get("node_url") and verbose:
         lines.append(f"  node {st['node_url']}")
@@ -361,7 +431,7 @@ def cmd_sync(cfg, args):
                 out(f"  {common.time_local(r['at'])}  {r['what']}  {r['path']}" + (f"  ({r['by']})" if r.get("by") else ""))
             for p, why in e.skipped:
                 out(f"  not synced  {p}  ({why})")
-            out(f"{d['name']}: " + ("Up to date" if not err else err))
+            out(f"{d['name']}: " + (e.idle_text() if not err else err))
             rc = rc or (1 if err else 0)
         return rc
     engines = []
@@ -578,6 +648,7 @@ def menu_unmount(cfg):
 
 
 COMMANDS = {"pair": cmd_pair, "unlink": cmd_unlink, "drives": cmd_drives, "mount": cmd_mount, "unmount": cmd_unmount,
+            "share": cmd_share, "unshare": cmd_unshare, "leave": cmd_leave,
             "status": cmd_status, "sync": cmd_sync, "log": cmd_log, "update": cmd_update, "service": cmd_service}
 
 
