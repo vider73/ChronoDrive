@@ -433,7 +433,7 @@ def cmd_update(cfg, args):
     r = subprocess.run(["git", "-C", src, "pull", "--ff-only"], capture_output=True, text=True)
     out((r.stdout + r.stderr).strip())
     if r.returncode:
-        out("Update failed: git pull did not work (local changes in the checkout, or no network).")
+        out(f"Update failed: git pull did not work in {short_home(src)} (see above).")
         return 1
     now = subprocess.run(["git", "-C", src, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     if now == head and not flag(args, "--force"):
