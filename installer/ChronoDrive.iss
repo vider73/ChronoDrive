@@ -22,6 +22,9 @@ SolidCompression=yes
 WizardStyle=modern
 CloseApplications=yes
 UninstallDisplayIcon={app}\ChronoDrive.exe
+#ifdef SIGN
+SignTool=autofirma
+#endif
 
 [Tasks]
 Name: "startup"; Description: "Start ChronoDrive with Windows (tray icon)"; GroupDescription: "Startup:"

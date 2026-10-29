@@ -13,7 +13,9 @@ Server side and design: the Miniserver repo (`I:\LLMLab\Azure\miniserver`): `doc
 decisions), `pb_public/API.md` §17 (the contract this client follows), `tools/node/drive/drive_service.py` (what
 runs on the node). Build: `.\build.ps1` (CMake, VS 2022 x64, header-only ChronoUI from
 `M:\ChronoScan\v3\root\ChronoUI`, nlohmann/json vendored in `third_party/`). Installer: `installer/ChronoDrive.iss`
-(Inno Setup; the version lives there and CMake reads it).
+(Inno Setup; the version lives there and CMake reads it): `pwsh -File toolsuild_setup.ps1` builds and signs it
+(AutoFirmaCS on `S:\`), `pwsh -File tools\publish_setup.ps1 -Notes "..."` puts it behind the account on the Miniserver
+(`/chronodrive/#download`, the page where users also create and manage their drives).
 
 ## First run
 

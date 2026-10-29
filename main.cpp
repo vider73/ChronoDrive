@@ -22,7 +22,7 @@ using cd::json;
 constexpr UINT WM_APP_RESULT = WM_APP + 1;
 constexpr UINT WM_APP_TRAY = WM_APP + 3;
 constexpr UINT kTrayId = 1;
-enum { kMenuOpen = 101, kMenuFolder = 102, kMenuPause = 103, kMenuExit = 109, kMenuRecent = 200 };
+enum { kMenuOpen = 101, kMenuFolder = 102, kMenuPause = 103, kMenuPage = 104, kMenuExit = 109, kMenuRecent = 200 };
 
 static const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static std::wstring ExePathW() { wchar_t b[MAX_PATH * 2]; GetModuleFileNameW(nullptr, b, MAX_PATH * 2); return b; }
@@ -130,6 +130,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   auto* lDrive = lbl(L"Drive");
   auto* driveCombo = win.Add<VCombo>(); driveCombo->Items({L"(no drives yet)"}).Select(0).FontSize(12.5f);
   auto* refreshBtn = win.Add<VButton>(); refreshBtn->Text(L"Refresh");
+  auto* pageBtn = win.Add<VButton>(); pageBtn->Text(L"Manage on the web");
   auto* lNew = lbl(L"New drive");
   auto* newName = input(L"Documents");
   auto* newSize = win.Add<VStepper>(); newSize->Range(1, 100000).Set(10);
@@ -204,6 +205,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   confirmDlg->OnResult([&](int r) { if (r != 0) return; if (eng) { eng->Stop(); eng.reset(); } sec.Clear(); sec.Save(); cfg.email.clear(); cfg.device_id.clear(); cfg.drive_id.clear(); cd::SaveConfig(cfg); DeleteFileW(cd::IndexPath().c_str()); drives = json::array(); places = json::array(); fillAccount(); fillDrives(); applyStatus(); repaint(); });
   unlinkBtn->OnClick([&] { confirmDlg->Title(L"Unlink this PC?").Body(L"The account's credentials are forgotten on this PC and syncing stops. The files in the local folder and on the drive stay as they are."); confirmDlg->Open(); repaint(); });
   refreshBtn->OnClick([&] { loadDrives(); });
+  pageBtn->OnClick([&] { ShellExecuteW(nullptr, L"open", W(cfg.url + "/chronodrive/#mine").c_str(), nullptr, nullptr, SW_SHOWNORMAL); });
   createBtn->OnClick([&] {
     int s = (int)nodeCombo->SelectedIndex(); if (s < 0 || s >= (int)placeKeys->size()) return;
     std::string key = (*placeKeys)[(size_t)s], node = key.substr(0, key.find('|')), fs = key.substr(key.find('|') + 1), name = U(newName->GetText());
@@ -235,7 +237,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     stateLbl->SetBounds(vd::Rect(pad, y, cw, 22)); y += 22; detailLbl->SetBounds(vd::Rect(pad, y, cw, 18)); y += 28;
     lAccount->SetBounds(vd::Rect(pad, y, cw, 18)); y += 20; accountLbl->SetBounds(vd::Rect(pad, y, cw, 20)); y += 24;
     urlBox->SetBounds(vd::Rect(pad, y, (std::min)(cw - 280, 420.0f), 32)); pairBtn->SetBounds(vd::Rect(pad + (std::min)(cw - 280, 420.0f) + 10, y, 130, 32)); unlinkBtn->SetBounds(vd::Rect(pad + (std::min)(cw - 280, 420.0f) + 150, y, 100, 32)); y += 44;
-    lDrive->SetBounds(vd::Rect(pad, y, cw, 18)); y += 20; driveCombo->SetBounds(vd::Rect(pad, y, cw - 110, 32)); refreshBtn->SetBounds(vd::Rect(Wd - pad - 100, y, 100, 32)); y += 40;
+    lDrive->SetBounds(vd::Rect(pad, y, cw, 18)); y += 20; driveCombo->SetBounds(vd::Rect(pad, y, cw - 290, 32)); refreshBtn->SetBounds(vd::Rect(Wd - pad - 280, y, 100, 32)); pageBtn->SetBounds(vd::Rect(Wd - pad - 170, y, 170, 32)); y += 40;
     lNew->SetBounds(vd::Rect(pad, y, cw, 18)); y += 20;
     newName->SetBounds(vd::Rect(pad, y, 200, 32)); newSize->SetBounds(vd::Rect(pad + 210, y, 90, 32)); lSize->SetBounds(vd::Rect(pad + 305, y + 7, 30, 18)); nodeCombo->SetBounds(vd::Rect(pad + 340, y, cw - 340 - 370, 32)); backupChk->SetBounds(vd::Rect(Wd - pad - 360, y + 4, 230, 24)); createBtn->SetBounds(vd::Rect(Wd - pad - 120, y, 120, 32)); y += 44;
     lFolder->SetBounds(vd::Rect(pad, y, cw, 18)); y += 20; folderBox->SetBounds(vd::Rect(pad, y, cw - 260, 32)); browseBtn->SetBounds(vd::Rect(Wd - pad - 250, y, 100, 32)); startBtn->SetBounds(vd::Rect(Wd - pad - 140, y, 140, 32)); y += 38;
@@ -262,6 +264,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         AppendMenuW(m, MF_STRING, kMenuOpen, L"Open ChronoDrive");
         AppendMenuW(m, MF_STRING | (cfg.folder.empty() ? MF_GRAYED : 0), kMenuFolder, L"Open folder");
         AppendMenuW(m, MF_STRING | (eng ? 0 : MF_GRAYED), kMenuPause, eng && eng->Paused() ? L"Resume sync" : L"Pause sync");
+        AppendMenuW(m, MF_STRING, kMenuPage, L"Your drives on the Miniserver");
         if (eng) { auto s = eng->Status(); if (!s.recent.empty()) { HMENU r = CreatePopupMenu(); int i = 0; for (auto& c : s.recent) AppendMenuW(r, MF_STRING | MF_GRAYED, kMenuRecent + i++, W(cd::TimeLocal(c.at) + "  " + c.what + "  " + c.path).c_str()); AppendMenuW(m, MF_POPUP, (UINT_PTR)r, L"Recent changes"); } }
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(m, MF_STRING, kMenuExit, L"Exit (syncing stops)");
@@ -271,6 +274,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         if (cmd == kMenuOpen) showWindow();
         else if (cmd == kMenuFolder) ShellExecuteW(nullptr, L"open", cfg.folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         else if (cmd == kMenuPause && eng) { cfg.paused = !eng->Paused(); eng->Pause(cfg.paused); cd::SaveConfig(cfg); }
+        else if (cmd == kMenuPage) ShellExecuteW(nullptr, L"open", W(cfg.url + "/chronodrive/#mine").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         else if (cmd == kMenuExit) { tray.Remove(); PostQuitMessage(0); }
       }
       return true;
