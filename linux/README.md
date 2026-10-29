@@ -9,7 +9,7 @@ A console program and a background service. Python 3.8+ standard library only: n
 ## Install (from git)
 
 ```bash
-git clone <REPO_URL> ChronoDrive      # placeholder: the repository has no public remote yet
+git clone https://github.com/vider73/ChronoDrive.git
 cd ChronoDrive
 ./linux/install.sh
 ```

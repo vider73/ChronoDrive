@@ -12,8 +12,8 @@ cdrive.exe        the console twin: pair, drives, create, use, sync, status, log
 Server side and design: the Miniserver repo (`I:\LLMLab\Azure\miniserver`): `docs/chronodrive.md` (the plan and the
 decisions), `pb_public/API.md` §17 (the contract this client follows), `tools/node/drive/drive_service.py` (what
 runs on the node). Build: `.\build.ps1` (CMake, VS 2022 x64, header-only ChronoUI from
-`M:\ChronoScan\v3\root\ChronoUI`, nlohmann/json vendored in `third_party/`). Installer: `installer/ChronoDrive.iss`
-(Inno Setup; the version lives there and CMake reads it): `pwsh -File toolsuild_setup.ps1` builds and signs it
+`M:\ChronoScan\v3\root\ChronoUI` (public: https://github.com/vider73/ChronoUI, pass `-DCHRONOUI_ROOT=<clone>`), nlohmann/json vendored in `third_party/`). Installer: `installer/ChronoDrive.iss`
+(Inno Setup; the version lives there and CMake reads it): `pwsh -File tools\build_setup.ps1` builds and signs it
 (AutoFirmaCS on `S:\`), `pwsh -File tools\publish_setup.ps1 -Notes "..."` puts it behind the account on the Miniserver
 (`/chronodrive/#download`, the page where users also create and manage their drives).
 
@@ -41,7 +41,7 @@ cdrive remove <drive id>                  # off this PC; the files stay
 ## Linux
 
 `linux/` is the Linux client: a console program plus a `systemd --user` service, Python standard library only, same
-protocol and sync rules, so Linux and Windows PCs share a drive. Install from a clone with `./linux/install.sh`, then
+protocol and sync rules, so Linux and Windows PCs share a drive. Install from a clone (`git clone https://github.com/vider73/ChronoDrive.git`) with `./linux/install.sh`, then
 `chronodrive pair`, `chronodrive drives`, `chronodrive mount <drive> [folder]`. A drive is a folder there
 (`~/ChronoDrive/<name>` by default); names Windows refuses are skipped and reported. Details: [linux/README.md](linux/README.md).
 
