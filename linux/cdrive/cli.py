@@ -79,9 +79,9 @@ def forget_device(cfg):
 
 def guard(fn):
     """Runs a command; readable errors, and a revoked device forgets its credentials (API.md section 2)."""
-    def run(cfg, args):
+    def run(cfg, *args):
         try:
-            return fn(cfg, args)
+            return fn(cfg, *args)
         except Revoked:
             forget_device(cfg)
             out("This PC was unlinked on the Miniserver. Pair it again: chronodrive pair")
