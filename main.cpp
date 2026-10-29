@@ -71,7 +71,7 @@ static D2D1_COLOR_F StateColor(const std::string& st) {
 }
 
 // ------------------------------------------------------------------ a drive card: a disk glyph, the name, where it lives, its state on this PC
-struct CardData { std::wstring name, where, state, detail; std::string stateKey; bool onPc = false, selected = false, panel = false; };
+struct CardData { std::wstring name, where, state, detail, share; std::string stateKey; bool onPc = false, selected = false, panel = false, shareWarn = false; };
 class VDriveCard : public VirtualWidgetImpl {
  public:
   CardData d;
@@ -85,11 +85,12 @@ class VDriveCard : public VirtualWidgetImpl {
     vd::Fill(rt, g, d.onPc ? Indigo() : vctl::Track(), 7.0f);
     vd::Fill(rt, vd::Rect(g.left + 8, g.top + 21, 20, 4), d.onPc ? D2D1::ColorF(1, 1, 1, 0.55f) : vctl::Border(), 2.0f);
     vd::Fill(rt, vd::Rect(g.right - 12, g.top + 20, 6, 6), d.onPc ? StateColor(d.stateKey) : vctl::Muted(), 3.0f);
-    float x = m_bounds.left + 80, w = (std::max)(120.0f, m_bounds.right - x - 360);
+    float x = m_bounds.left + 80, w = (std::max)(120.0f, m_bounds.right - x - 440);
     vd::Text(rt, d.name, vd::Rect(x, m_bounds.top + 12, w, 24), vctl::Ink(), vd::Style().Size(17).Bold());
     vd::Text(rt, d.where, vd::Rect(x, m_bounds.top + 38, w, 20), vctl::Muted(), vd::Style().Size(13.5f));
     std::wstring line = d.state + d.detail;
     vd::Text(rt, line, vd::Rect(x, m_bounds.top + 60, m_bounds.right - x - 16, 20), d.onPc ? StateColor(d.stateKey) : vctl::Muted(), vd::Style().Size(14).Bold());
+    if (!d.share.empty()) vd::Text(rt, d.share, vd::Rect(x, m_bounds.top + 84, m_bounds.right - x - 16, 20), d.shareWarn ? D2D1::ColorF(0xD97706) : Indigo(), vd::Style().Size(13.5f));
   }
 };
 
@@ -166,9 +167,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   auto* newBtn = ghost(win.Add<VButton>()); newBtn->Text(L"New drive\x2026");
   auto* refreshBtn = ghost(win.Add<VButton>()); refreshBtn->Text(L"Refresh");
   auto* emptyLbl = win.Add<VLabel>(); emptyLbl->Text(L"").FontSize(14.0f).Muted(true);
-  VDriveCard* cards[kMaxCards]; VButton* mainBtn[kMaxCards]; VButton* pauseBtn[kMaxCards]; VButton* removeBtn[kMaxCards];
+  VDriveCard* cards[kMaxCards]; VButton* mainBtn[kMaxCards]; VButton* pauseBtn[kMaxCards]; VButton* removeBtn[kMaxCards]; VButton* shareBtn[kMaxCards];
   for (int i = 0; i < kMaxCards; ++i) {
     cards[i] = win.Add<VDriveCard>();
+    shareBtn[i] = ghost(win.Add<VButton>()); shareBtn[i]->Text(L"Share");
     mainBtn[i] = primary(win.Add<VButton>());
     pauseBtn[i] = ghost(win.Add<VButton>()); pauseBtn[i]->Text(L"Pause");
     removeBtn[i] = ghost(win.Add<VButton>()); removeBtn[i]->Text(L"Remove from PC");
@@ -184,6 +186,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   auto* mapOk = primary(win.Add<VButton>()); mapOk->Text(L"Show it");
   auto* mapCancel = ghost(win.Add<VButton>()); mapCancel->Text(L"Cancel");
   std::vector<std::wstring> letterChoices; int mapModeSel = 0; std::string openMapLater;
+  // ---- the "share" panel (under the chosen card; the owner's drives): an email, Can edit / Read only, who has it
+  constexpr int kMaxMembers = 5;
+  auto* sharePanel = win.Add<VDriveCard>(); sharePanel->d.panel = true; sharePanel->d.selected = true;
+  auto* shareTitle = win.Add<VLabel>(); shareTitle->Text(L"Share with").FontSize(14.5f);
+  auto* shareEmail = win.Add<VChatInput>(); shareEmail->SetSingleLine(true).SetPlaceholder(L"their email").SetFontSize(14.0f);
+  auto* shareRole = win.Add<VSegment>(std::vector<std::wstring>{L"Can edit", L"Read only"});
+  auto* shareOk = primary(win.Add<VButton>()); shareOk->Text(L"Share");
+  auto* shareHint = win.Add<VLabel>(); shareHint->Text(L"").FontSize(13.0f).Muted(true);
+  VLabel* memberLbl[kMaxMembers]; VButton* memberDel[kMaxMembers];
+  for (int i = 0; i < kMaxMembers; ++i) { memberLbl[i] = win.Add<VLabel>(); memberLbl[i]->Text(L"").FontSize(14.0f); memberDel[i] = ghost(win.Add<VButton>()); memberDel[i]->Text(L"Remove"); }
+  auto* shareWeb = ghost(win.Add<VButton>()); shareWeb->Text(L"Change on the web");
+  auto* shareClose = ghost(win.Add<VButton>()); shareClose->Text(L"Close");
+  std::string shareId; int shareRoleSel = 0; bool shareBusy = false; std::string shareNote; bool shareNoteBad = false;
   // ---- bottom
   auto* recentTitle = win.Add<VLabel>(); recentTitle->Text(L"Recent changes").FontSize(15.0f);
   auto* recent = win.Add<VLines>();
@@ -194,10 +209,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   std::function<void()> relayout;
   auto visibleDrives = [&] { std::vector<json> v; for (auto& d : drives) if (!d.value("deleting", false)) v.push_back(d); return v; };
   auto driveName = [&](const std::string& id) { for (auto& d : drives) if (d.value("id", "") == id) return d.value("name", std::string()); return std::string(); };
+  auto driveById = [&](const std::string& id) { for (auto& d : drives) if (d.value("id", "") == id) return d; return json(); };
+  auto membersOf = [&](const std::string& id) { json d = driveById(id); return d.is_object() ? d.value("members", json::array()) : json::array(); };
+  auto cleanErr = [](std::string e) { if (e.rfind("http ", 0) == 0) { size_t c = e.find(": "); if (c != std::string::npos) e = e.substr(c + 2); } return e; };
   auto stateText = [&](const cd::Mapping& m, std::string& key, std::wstring& detail) -> std::wstring {
     auto st = set.Status(m.id); key = st.state; detail.clear();
     std::wstring at = cd::ShownAt(m);
     if (!set.Running(m.id)) { key = "error"; return at + L"   \x00b7   not syncing"; }
+    if (st.state == "idle" && st.readOnly) return at + L"   \x00b7   Up to date, read only" + (st.localOnly ? L"   \x00b7   " + std::to_wstring(st.localOnly) + (st.localOnly == 1 ? L" change of yours stays on this PC" : L" changes of yours stay on this PC") : L"");
     if (st.state == "idle") return at + L"   \x00b7   Up to date";
     if (st.state == "syncing") return at + L"   \x00b7   Syncing" + (st.pending ? L", " + std::to_wstring(st.pending) + L" left" : L"") + (st.bytesTotal ? L" (" + W(cd::Human(st.bytesDone)) + L" of " + W(cd::Human(st.bytesTotal)) + L")" : L"");
     if (st.state == "paused") return at + L"   \x00b7   Paused";
@@ -217,14 +236,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     emptyLbl->SetVisible(paired && !emptyLbl->GetText().empty());
     for (int i = 0; i < kMaxCards; ++i) {
       bool on = paired && i < (int)vis.size();
-      cards[i]->SetVisible(on); mainBtn[i]->SetVisible(on); pauseBtn[i]->SetVisible(false); removeBtn[i]->SetVisible(false);
+      cards[i]->SetVisible(on); mainBtn[i]->SetVisible(on); pauseBtn[i]->SetVisible(false); removeBtn[i]->SetVisible(false); shareBtn[i]->SetVisible(on);
       if (!on) continue;
       const json& d = vis[(size_t)i]; std::string id = d.value("id", "");
       CardData c; c.name = W(d.value("name", ""));
       std::string node = d.value("node", ""); bool home = d.value("node_kind", "") == "home";
       c.where = std::to_wstring(d.value("size_gb", 0)) + L" GB   \x00b7   " + W(cd::Human(d.value("used", (uint64_t)0))) + L" used   \x00b7   "
               + (home ? L"at home (" + W(node) + L")" : node == "office" ? std::wstring(L"in the office") : L"node " + W(node));
-      c.selected = id == mapId;
+      c.selected = id == mapId || id == shareId;
+      // sharing (API.md section 17): the owner sees who has it; a member sees whose it is and what it may do
+      if (d.value("owner", true)) {
+        json ms = d.value("members", json::array()); shareBtn[i]->Text(L"Share");
+        if (!ms.empty()) { std::wstring who; for (size_t k = 0; k < ms.size() && k < 2; ++k) who += (k ? L", " : L"") + W(ms[k].value("email", "")); if (ms.size() > 2) who += L" and " + std::to_wstring(ms.size() - 2) + L" more"; c.share = L"Shared with " + who; }
+      } else {
+        bool ro = d.value("role", "") == "read"; shareBtn[i]->Text(L"Leave");
+        c.share = L"Shared with you by " + W(d.value("owner_email", "")) + (ro ? L"   \x00b7   read only: your changes stay on this PC" : L"   \x00b7   you can edit"); c.shareWarn = ro;
+      }
       if (auto* m = cfg.Find(id)) {
         c.onPc = true; c.state = stateText(*m, c.stateKey, c.detail);
         mainBtn[i]->Text(L"Open"); pauseBtn[i]->SetVisible(true); removeBtn[i]->SetVisible(true);
@@ -239,6 +266,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     mapPanel->SetVisible(mapping); mapTitle->SetVisible(mapping); mapMode->SetVisible(mapping); mapHint->SetVisible(mapping); mapOk->SetVisible(mapping); mapCancel->SetVisible(mapping);
     bool letter = mapModeSel == 0;
     letterCombo->SetVisible(mapping && letter); folderBox->SetVisible(mapping && !letter); browseBtn->SetVisible(mapping && !letter);
+    bool sharing = paired && !shareId.empty();
+    json sms = sharing ? membersOf(shareId) : json::array();
+    for (auto* x : std::initializer_list<VirtualWidgetImpl*>{sharePanel, shareTitle, shareEmail, shareRole, shareOk, shareHint, shareWeb, shareClose}) x->SetVisible(sharing);
+    for (int k = 0; k < kMaxMembers; ++k) {
+      bool row = sharing && (k < (int)sms.size() || (k == 0 && sms.empty()));
+      memberLbl[k]->SetVisible(row); memberDel[k]->SetVisible(row && k < (int)sms.size());
+      if (!row) continue;
+      if (sms.empty()) { memberLbl[k]->Text(L"Not shared with anybody yet.").Muted(true); continue; }
+      if (k == kMaxMembers - 1 && sms.size() > (size_t)kMaxMembers) { memberLbl[k]->Text(L"and " + std::to_wstring(sms.size() - kMaxMembers + 1) + L" more (see them on the web)").Muted(true); memberDel[k]->SetVisible(false); continue; }
+      const json& mm = sms[(size_t)k];
+      memberLbl[k]->Text(W(mm.value("email", "")) + L"   \x00b7   " + (mm.value("role", "") == "read" ? L"read only" : L"can edit")).Muted(false);
+    }
+    shareOk->Enabled(!shareBusy);
+    if (sharing) {
+      bool home = driveById(shareId).value("node_kind", "") == "home";
+      shareHint->Text(!shareNote.empty() ? W(shareNote) : home ? L"They need a Miniserver account. This drive is on your home node: they reach it only on your home network."
+                                                               : L"They need a Miniserver account. It shows up in their ChronoDrive at once, and they get an email.");
+      shareHint->Muted(!shareNoteBad);
+    }
     mapHint->Text(letter ? L"Its own disk in Explorer. The files are kept in " + cd::BackingFolder(driveName(mapId)) + L"."
                          : L"The folder gets the drive's files and stays in step with it.");
     // tray and recent changes
@@ -301,7 +347,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   };
 
   auto openMap = [&](const std::string& id) {
-    mapId = id;
+    mapId = id; shareId.clear();
     cd::Mapping* m = cfg.Find(id);
     letterChoices = cd::FreeLetters(m ? m->letter : L"");
     std::vector<std::wstring> items; for (auto& L : letterChoices) items.push_back(L + L":");
@@ -321,11 +367,58 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     pauseBtn[i]->OnClick([&, i] { std::string id = idAt(i); if (auto* m = cfg.Find(id)) { set.Pause(id, !m->paused); cd::SaveConfig(cfg); fill(); repaint(); } });
     removeBtn[i]->OnClick([&, i] {
       std::string id = idAt(i); auto* m = cfg.Find(id); if (!m) return;
-      confirmDlg->Title(L"Remove \"" + W(m->name) + L"\" from this PC?").Body(L"It stops syncing here" + std::wstring(m->mode == "letter" ? L" and its drive letter goes" : L"") + L". The files stay in " + m->folder + L". The drive on the Miniserver is not touched.");
+      confirmDlg->Title(L"Remove \"" + W(m->name) + L"\" from this PC?").Body(L"It stops syncing here" + std::wstring(m->mode == "letter" ? L" and its drive letter goes" : L"") + L". The files stay in " + m->folder + L". The drive on the Miniserver is not touched.").Primary(L"Remove");
       onConfirm = [&, id] { set.Remove(id); cd::SaveConfig(cfg); fill(); repaint(); };
       confirmDlg->Open(); repaint();
     });
   }
+  auto doShare = [&](std::wstring emailW) {
+    std::string email = U(emailW); while (!email.empty() && email.back() == ' ') email.pop_back(); while (!email.empty() && email.front() == ' ') email.erase(0, 1);
+    if (email.empty() || shareId.empty() || shareBusy) { if (email.empty()) { shareNote = "Type their email."; shareNoteBad = true; fill(); repaint(); } return; }
+    shareBusy = true; shareNote = "Sharing\xe2\x80\xa6"; shareNoteBad = false; fill(); repaint();
+    cd::Config c = cfg; std::string secret = sec.Get("device_secret"), id = shareId, role = shareRoleSel == 1 ? "read" : "write";
+    Async([c, secret, id, email, role](std::string& err) { cd::Miniserver ms(c.url, c.standby, c.device_id, secret); return ms.Json(L"POST", "/api/ms/drive/drives/" + id + "/members", json({{"email", email}, {"role", role}}), err); },
+      [&, email, role](const json& r, const std::string& err) {
+        shareBusy = false;
+        if (!err.empty() || r.is_null()) { shareNote = cleanErr(err); shareNoteBad = true; shareEmail->SetText(cd::Wide(email)); fill(); repaint(); return; }
+        shareNote = "Shared with " + email + (role == "read" ? " (read only)" : " (can edit)") + ". They got an email."; shareNoteBad = false;
+        shareEmail->SetText(L""); loadDrives(); fill(); repaint();
+      });
+  };
+  shareOk->OnClick([&] { doShare(shareEmail->GetText()); });
+  shareEmail->OnSubmit([&](const std::wstring& t) { doShare(t); });
+  shareRole->OnChange([&](int s) { shareRoleSel = s; });
+  shareClose->OnClick([&] { shareId.clear(); shareNote.clear(); fill(); repaint(); });
+  shareWeb->OnClick([&] { OpenPath(W(cfg.url + "/chronodrive/#mine")); });
+  for (int k = 0; k < kMaxMembers; ++k) memberDel[k]->OnClick([&, k] {
+    json ms = membersOf(shareId); if (k >= (int)ms.size()) return;
+    std::string id = shareId, user = ms[(size_t)k].value("user", ""), email = ms[(size_t)k].value("email", "");
+    confirmDlg->Title(L"Stop sharing \"" + W(driveName(id)) + L"\" with " + W(email) + L"?").Body(L"Their PCs stop syncing it and keep the files they have.").Primary(L"Remove");
+    onConfirm = [&, id, user, email] {
+      cd::Config c = cfg; std::string secret = sec.Get("device_secret");
+      Async([c, secret, id, user](std::string& err) { cd::Miniserver ms(c.url, c.standby, c.device_id, secret); return ms.Json(L"DELETE", "/api/ms/drive/drives/" + id + "/members/" + user, nullptr, err); },
+        [&, email](const json&, const std::string& err) { shareNote = err.empty() ? "No longer shared with " + email + "." : cleanErr(err); shareNoteBad = !err.empty(); loadDrives(); fill(); repaint(); });
+    };
+    confirmDlg->Open(); repaint();
+  });
+  for (int i = 0; i < kMaxCards; ++i) shareBtn[i]->OnClick([&, i] {
+    std::string id = idAt(i); if (id.empty()) return;
+    json d = driveById(id);
+    if (d.value("owner", true)) { mapId.clear(); shareId = shareId == id ? "" : id; shareNote.clear(); shareNoteBad = false; shareEmail->SetText(L""); shareRoleSel = 0; shareRole->Set(0); fill(); repaint(); return; }
+    std::string name = d.value("name", ""), owner = d.value("owner_email", "");
+    confirmDlg->Title(L"Leave \"" + W(name) + L"\"?").Body(L"It stops syncing on this PC (the files here stay) and goes from your drives. " + W(owner) + L" can share it with you again.").Primary(L"Leave");
+    onConfirm = [&, id, name] {
+      cd::Config c = cfg; std::string secret = sec.Get("device_secret");
+      Async([c, secret, id](std::string& err) { cd::Miniserver ms(c.url, c.standby, c.device_id, secret); return ms.Json(L"DELETE", "/api/ms/drive/drives/" + id + "/members/me", nullptr, err); },
+        [&, id, name](const json&, const std::string& err) {
+          if (!err.empty()) { showMsg(L"Cannot leave", W(cleanErr(err))); return; }
+          if (cfg.Find(id)) { set.Remove(id); cd::SaveConfig(cfg); }
+          for (size_t k = 0; k < drives.size(); ++k) if (drives[k].value("id", "") == id) { drives.erase(k); break; }
+          serverNote = "You left \"" + name + "\"."; loadDrives(); fill(); repaint();
+        });
+    };
+    confirmDlg->Open(); repaint();
+  });
   mapMode->OnChange([&](int s) { mapModeSel = s; fill(); repaint(); });
   browseBtn->OnClick([&] { std::wstring p = PickFolder(g_hwnd, folderBox->GetText(), L"Folder for this drive"); if (!p.empty()) { folderBox->SetText(p); repaint(); } });
   mapCancel->OnClick([&] { mapId.clear(); fill(); repaint(); });
@@ -359,7 +452,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     });
   });
   unlinkBtn->OnClick([&] {
-    confirmDlg->Title(L"Unlink this PC?").Body(L"Every drive stops syncing here and the drive letters go. The files stay on this PC and on the Miniserver.");
+    confirmDlg->Title(L"Unlink this PC?").Body(L"Every drive stops syncing here and the drive letters go. The files stay on this PC and on the Miniserver.").Primary(L"Unlink");
     onConfirm = [&] { std::vector<std::string> ids; for (auto& m : cfg.maps) ids.push_back(m.id); for (auto& id : ids) set.Remove(id); sec.Clear(); sec.Save(); cfg.email.clear(); cfg.device_id.clear(); cd::SaveConfig(cfg); drives = json::array(); loaded = false; fill(); repaint(); };
     confirmDlg->Open(); repaint();
   });
@@ -383,14 +476,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     auto vis = visibleDrives();
     for (int i = 0; i < kMaxCards; ++i) {
       if (!cards[i]->IsVisible()) continue;
-      const float ch = 90.0f;
+      const float ch = cards[i]->d.share.empty() ? 90.0f : 112.0f;
       cards[i]->SetBounds(vd::Rect(pad, y, cw, ch));
       float bx = Wd - pad - 16;
       if (removeBtn[i]->IsVisible()) {
         removeBtn[i]->SetBounds(vd::Rect(bx - 132, y + 16, 132, 32)); bx -= 140;
         pauseBtn[i]->SetBounds(vd::Rect(bx - 84, y + 16, 84, 32)); bx -= 92;
-        mainBtn[i]->SetBounds(vd::Rect(bx - 84, y + 16, 84, 32));
-      } else mainBtn[i]->SetBounds(vd::Rect(bx - 150, y + 16, 150, 32));
+        mainBtn[i]->SetBounds(vd::Rect(bx - 84, y + 16, 84, 32)); bx -= 92;
+      } else { mainBtn[i]->SetBounds(vd::Rect(bx - 150, y + 16, 150, 32)); bx -= 158; }
+      shareBtn[i]->SetBounds(vd::Rect(bx - 76, y + 16, 76, 32));
       y += ch + 10;
       if (i < (int)vis.size() && vis[(size_t)i].value("id", "") == mapId && mapPanel->IsVisible()) {
         const float ph = 156.0f; float px = pad + 30, py = y;
@@ -400,6 +494,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         folderBox->SetBounds(vd::Rect(px, py + 58, cw - 220, 36)); browseBtn->SetBounds(vd::Rect(px + cw - 210, py + 60, 110, 32));
         mapHint->SetBounds(vd::Rect(px, py + 104, cw - 320, 40));
         mapCancel->SetBounds(vd::Rect(Wd - pad - 16 - 100, py + ph - 48, 100, 34)); mapOk->SetBounds(vd::Rect(Wd - pad - 16 - 220, py + ph - 48, 110, 34));
+        y += ph + 12;
+      }
+      if (i < (int)vis.size() && vis[(size_t)i].value("id", "") == shareId && sharePanel->IsVisible()) {
+        int rows = 0; for (int k = 0; k < kMaxMembers; ++k) if (memberLbl[k]->IsVisible()) ++rows;
+        float ph = 100.0f + rows * 34.0f + 52.0f, px = pad + 30, py = y, inner = cw - 14 - 32;
+        sharePanel->SetBounds(vd::Rect(pad + 14, py, cw - 14, ph));
+        float ew = (std::max)(160.0f, inner - 100 - 210 - 90 - 30);
+        shareTitle->SetBounds(vd::Rect(px, py + 20, 100, 22)); shareEmail->SetBounds(vd::Rect(px + 100, py + 14, ew, 36));
+        shareRole->SetBounds(vd::Rect(px + 110 + ew, py + 16, 210, 32)); shareOk->SetBounds(vd::Rect(px + 130 + ew + 210, py + 15, 90, 34));
+        shareHint->SetBounds(vd::Rect(px, py + 62, inner, 22));
+        float ry = py + 96;
+        for (int k = 0; k < kMaxMembers; ++k) { if (!memberLbl[k]->IsVisible()) continue; memberLbl[k]->SetBounds(vd::Rect(px, ry + 5, inner - 110, 22)); memberDel[k]->SetBounds(vd::Rect(px + inner - 96, ry, 96, 30)); ry += 34; }
+        shareWeb->SetBounds(vd::Rect(px, py + ph - 46, 170, 34)); shareClose->SetBounds(vd::Rect(Wd - pad - 16 - 100, py + ph - 46, 100, 34));
         y += ph + 12;
       }
     }

@@ -44,6 +44,8 @@ struct SyncStatus {
   std::string detail, nodeUrl;
   int pending = 0; uint64_t bytesDone = 0, bytesTotal = 0;
   time_t lastSync = 0;
+  bool readOnly = false;          // shared with this account to read only: nothing goes up
+  int localOnly = 0;              // read only: files new or changed here that stay on this PC
   std::deque<RecentChange> recent;
 };
 
@@ -113,7 +115,7 @@ class Engine {
   std::mutex m_mx; std::condition_variable m_cv;
   std::thread m_worker, m_watcher, m_poller;
   std::mutex m_smx; SyncStatus m_status;
-  Index m_idx; DriveClient m_dc; std::string m_grantUrls; time_t m_grantExp = 0, m_lastUrlCheck = 0; json m_urls; std::string m_certSha;
+  Index m_idx; DriveClient m_dc; std::string m_grantUrls; time_t m_grantExp = 0, m_lastUrlCheck = 0; json m_urls; std::string m_certSha; bool m_readOnly = false;
   std::wstring m_root; std::string m_pc;
 
   void SetState(const std::string& st, const std::string& detail = "") { std::lock_guard<std::mutex> lk(m_smx); m_status.state = st; m_status.detail = detail; }
@@ -129,6 +131,8 @@ class Engine {
       json g = ms.Json(L"POST", "/api/ms/drive/drives/" + m_cfg.drive_id + "/grant", json({{"device", m_pc}}), err);
       if (g.is_null()) { if (err.find("http 403") != std::string::npos || err.find("http 404") != std::string::npos || err == "revoked") { SetState("error", err == "revoked" ? "This PC was unlinked on the Miniserver: pair it again." : "The drive is disabled or gone: " + err); return false; } SetState("offline", "Miniserver: " + err); return false; }
       m_dc.grant = g.value("grant", ""); m_grantExp = g.value("exp", (int64_t)0); m_urls = g.value("urls", json::array()); m_certSha = g.value("cert_sha256", ""); m_lastUrlCheck = Now();
+      // a read-only member's grant has six parts, <id>.<user>.<device>.<exp>.r.<sig> (API.md section 17 "Sharing")
+      { size_t dots = 0; for (char ch : m_dc.grant) dots += ch == '.'; m_readOnly = dots == 5; std::lock_guard<std::mutex> lk(m_smx); m_status.readOnly = m_readOnly; }
       // CHRONODRIVE_NODE_URL=https://host:port replaces the node's address (a home node over the user's own VPN,
       // tests from another network); the pinned certificate still has to match, so it is not a way around it
       std::string over = Utf8(EnvW(L"CHRONODRIVE_NODE_URL"));
@@ -252,6 +256,28 @@ class Engine {
     }
     return true;
   }
+  // ---- a drive shared to read only: nothing goes up. Files deleted here come back from the drive; files new or changed
+  // here stay on this PC (counted for the card), and a later change on the drive keeps them as conflict copies (Apply)
+  bool KeepReadOnly(std::string& err) {
+    std::vector<LocalFile> files; ScanDir(m_root, L"", files);
+    std::set<std::string> seen; int localOnly = 0;
+    for (auto& f : files) {
+      seen.insert(f.path);
+      if (f.dir) continue;
+      auto it = m_idx.files.find(f.path);
+      if (it == m_idx.files.end() || it->second.dir || it->second.size != f.size || it->second.mtime / 1000 != f.mtime / 1000) ++localOnly;
+    }
+    std::vector<std::pair<std::string, IndexEntry>> missing; for (auto& [p, ie] : m_idx.files) if (!seen.count(p)) missing.push_back({p, ie});
+    std::sort(missing.begin(), missing.end(), [](const auto& a, const auto& b) { return a.first.size() < b.first.size(); });   // folders before their files
+    for (auto& [p, ie] : missing) {
+      if (!m_run) return false;
+      if (ie.dir) { EnsureDir(ToLocal(m_root, p)); continue; }
+      Entry e; e.path = p; e.rev = ie.rev; e.kind = "file"; e.size = ie.size; e.mtime = ie.mtime; e.sha256 = ie.sha256;
+      m_idx.files.erase(p); Apply(e);   // downloads it again (Apply notes "downloaded")
+    }
+    { std::lock_guard<std::mutex> lk(m_smx); m_status.localOnly = localOnly; }
+    (void)err; return true;
+  }
   bool Upload(const LocalFile& f, std::string& err) {
     std::wstring local = ToLocal(m_root, f.path);
     std::string sha; uint64_t size = 0;
@@ -340,7 +366,7 @@ class Engine {
       backoff = 30;
       SetState("syncing", "Checking the drive\xe2\x80\xa6");
       try {
-        bool ok = PullRemote(err) && PushLocal(err);
+        bool ok = PullRemote(err) && (m_readOnly ? KeepReadOnly(err) : PushLocal(err));
         m_idx.Save();
         if (!ok) { Log("sync: " + err); SetState("offline", err); m_lastUrlCheck = 0; std::unique_lock<std::mutex> lk(m_mx); m_cv.wait_for(lk, std::chrono::seconds(30)); continue; }
       } catch (std::exception& ex) { m_idx.Save(); Log(std::string("sync: ") + ex.what()); SetState("offline", ex.what()); std::unique_lock<std::mutex> lk(m_mx); m_cv.wait_for(lk, std::chrono::seconds(30)); continue; }

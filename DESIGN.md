@@ -43,9 +43,15 @@ letter or in a folder, after José found the single folder confusing.
   Every failure makes the engine ask the Miniserver again (the node's address may have changed), with a backoff
   from 30 s to 5 min.
 
+- **Sharing (0.3.0).** The owner shares a drive by email (Miniserver API.md section 17 "Sharing"); it shows up in
+  the member's list with `owner: false`, `role` and `owner_email`. Read only is the node's job: the member's grant
+  has a sixth part `r` and the drive service refuses writes with it. The engine sees the six-part grant and runs
+  `KeepReadOnly` instead of `PushLocal`: nothing goes up, files deleted locally come back, files new or changed
+  locally stay on the PC (counted in the status) and turn into conflict copies when the drive changes them.
+
 ## Tests
 
 - `tests/drive_service_test.py` in the Miniserver repo exercises the service alone.
-- The end-to-end run (two data folders paired as two devices, a drive on the office node, files both ways, a
-  conflict, a delete) is a script in this session's notes; it only needs `cdrive.exe`, the superuser of the
-  Miniserver and a throwaway user. Worth moving into `tools/` as `e2e.py` once a second office drive is cheap.
+- `tools/e2e.py [node]`: two data folders paired as two devices, a drive on the node, files both ways, a conflict,
+  a delete, then the drive shared with a second throwaway account (read only, then editable, then it leaves). It
+  needs `build\Release\cdrive.exe` and the Miniserver's `.secrets.env`.

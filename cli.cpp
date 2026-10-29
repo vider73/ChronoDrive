@@ -5,6 +5,9 @@
 //   cdrive create --name <n> --node <node> --size <GB> [--backup] [--mirror <node>]
 //   cdrive use <drive id> (--letter Z | --folder <path>)       show a drive on this PC as a drive letter or in a folder
 //   cdrive remove <drive id>                                   take it off this PC (the files stay)
+//   cdrive share <drive id> <email> [--read]                   share a drive with another Miniserver account (can edit, or read only)
+//   cdrive unshare <drive id> <email>                          stop sharing it with that account
+//   cdrive leave <drive id>                                    leave a drive somebody shared with you
 //   cdrive sync [--seconds <n>]                                sync every drive shown here (until Ctrl+C, or n seconds)
 //   cdrive update [--install]                                  is there a newer ChronoDrive? download and verify it (and install it)
 //   cdrive status                                              the configuration and the index summary
@@ -75,7 +78,12 @@ int wmain(int argc, wchar_t** argv) {
   if (cmd == "drives") {
     std::string err; json d = ms.Json(L"GET", "/api/ms/drive/drives", nullptr, err);
     if (d.is_null()) { out("drives: " + err); return 1; }
-    for (auto& x : d["drives"]) out(x.value("id", "") + "  " + x.value("name", "") + "  " + std::to_string(x.value("size_gb", 0)) + " GB on " + x.value("node", "") + " (" + x.value("node_kind", "") + ")  used " + Human(x.value("used", (uint64_t)0)) + "  " + (x.value("online", false) ? "online" : "offline") + "  urls " + x.value("urls", json::array()).dump());
+    for (auto& x : d["drives"]) {
+      std::string sh;
+      if (!x.value("owner", true)) sh = "  shared by " + x.value("owner_email", "") + (x.value("role", "") == "read" ? " (read only)" : " (can edit)");
+      else for (auto& m : x.value("members", json::array())) sh += (sh.empty() ? "  shared with " : ", ") + m.value("email", "") + (m.value("role", "") == "read" ? " (read)" : " (edit)");
+      out(x.value("id", "") + "  " + x.value("name", "") + "  " + std::to_string(x.value("size_gb", 0)) + " GB on " + x.value("node", "") + " (" + x.value("node_kind", "") + ")  used " + Human(x.value("used", (uint64_t)0)) + "  " + (x.value("online", false) ? "online" : "offline") + sh + "  urls " + x.value("urls", json::array()).dump());
+    }
     json n = ms.Json(L"GET", "/api/ms/drive/nodes", nullptr, err);
     if (!n.is_null()) { out("places (max " + std::to_string(n.value("max_gb", 0)) + " GB in all, " + std::to_string(n.value("used_gb", 0)) + " used):"); for (auto& p : n["nodes"]) out("  " + p.value("node", "") + " (" + p.value("kind", "") + ") " + p.value("mount", "") + "  " + std::to_string(p.value("free_gb", 0)) + " GB free of " + std::to_string(p.value("cap_gb", 0)) + (p.value("online", false) ? "  online" : "  offline")); }
     return 0;
@@ -106,6 +114,27 @@ int wmain(int argc, wchar_t** argv) {
     std::string id = Utf8(argv[2]); if (!cfg.Find(id)) { out("not shown on this PC: " + id); return 1; }
     { DriveSet set(cfg, ""); set.Remove(id); } SaveConfig(cfg); out("removed from this PC (the files stay)"); return 0;
   }
+  if (cmd == "share" && argc > 3) {
+    std::string id = Utf8(argv[2]), email = Utf8(argv[3]), err;
+    json r = ms.Json(L"POST", "/api/ms/drive/drives/" + id + "/members", json({{"email", email}, {"role", Flag(argc, argv, L"--read") ? "read" : "write"}}), err);
+    if (r.is_null()) { out("share: " + err); return 1; }
+    out("shared with " + r.value("email", "") + (r.value("role", "") == "read" ? " (read only)" : " (can edit)")); return 0;
+  }
+  if (cmd == "unshare" && argc > 3) {
+    std::string id = Utf8(argv[2]), email = Lower(Utf8(argv[3])), err, user;
+    json r = ms.Json(L"GET", "/api/ms/drive/drives/" + id + "/members", nullptr, err);
+    if (r.is_null()) { out("members: " + err); return 1; }
+    for (auto& m : r["members"]) if (Lower(m.value("email", "")) == email || m.value("user", "") == email) user = m.value("user", "");
+    if (user.empty()) { out("not shared with " + email); return 1; }
+    if (ms.Json(L"DELETE", "/api/ms/drive/drives/" + id + "/members/" + user, nullptr, err).is_null()) { out("unshare: " + err); return 1; }
+    out("no longer shared with " + email); return 0;
+  }
+  if (cmd == "leave" && argc > 2) {
+    std::string id = Utf8(argv[2]), err;
+    if (ms.Json(L"DELETE", "/api/ms/drive/drives/" + id + "/members/me", nullptr, err).is_null()) { out("leave: " + err); return 1; }
+    if (cfg.Find(id)) { DriveSet set(cfg, ""); set.Remove(id); SaveConfig(cfg); }
+    out("left the drive (the files on this PC stay)"); return 0;
+  }
   if (cmd == "sync") {
     int secs = atoi(Arg(argc, argv, L"--seconds", "0").c_str());
     SetConsoleCtrlHandler(OnCtrl, TRUE);
@@ -118,7 +147,7 @@ int wmain(int argc, wchar_t** argv) {
       Sleep(2000);
       for (auto& m : cfg.maps) {
         auto st = set.Status(m.id);
-        std::string line = st.state + "  " + st.detail + (st.pending ? "  pending " + std::to_string(st.pending) : "") + (st.bytesTotal ? "  " + Human(st.bytesDone) + "/" + Human(st.bytesTotal) : "") + (st.nodeUrl.empty() ? "" : "  @ " + st.nodeUrl);
+        std::string line = st.state + "  " + st.detail + (st.readOnly ? "  [read only" + (st.localOnly ? ", " + std::to_string(st.localOnly) + " local changes not sent" : std::string()) + "]" : "") + (st.pending ? "  pending " + std::to_string(st.pending) : "") + (st.bytesTotal ? "  " + Human(st.bytesDone) + "/" + Human(st.bytesTotal) : "") + (st.nodeUrl.empty() ? "" : "  @ " + st.nodeUrl);
         if (line != last[m.id]) { out(TimeLocal(Now()) + "  " + (cfg.maps.size() > 1 ? "[" + m.name + "] " : "") + line); last[m.id] = line; }
         if (st.state == "error") err = true;
       }
@@ -128,5 +157,5 @@ int wmain(int argc, wchar_t** argv) {
     set.StopAll();
     return err ? 1 : 0;
   }
-  out("cdrive " CD_VERSION_STR ": pair | unlink | drives | create | use | remove | sync | update | status | log"); return 2;
+  out("cdrive " CD_VERSION_STR ": pair | unlink | drives | create | use | remove | share | unshare | leave | sync | update | status | log"); return 2;
 }

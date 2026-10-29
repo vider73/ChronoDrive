@@ -1,6 +1,7 @@
 """End-to-end test of ChronoDrive against a real node: a throwaway user, two "PCs" (two data dirs, two devices paired
 through the real pairing flow and approved with the user's token), one drive on a node with the drive role, cdrive
-sync on both with files going both ways, a conflict, a delete. Everything is removed at the end.
+sync on both with files going both ways, a conflict, a delete; then the drive shared with a second account (PC-C),
+read only (nothing goes up, a delete comes back) and then editable. Everything is removed at the end.
 CHRONODRIVE_NODE_URL=https://host:port reaches a home node over Tailscale instead of its LAN address.
 
 Usage: python tools/e2e.py [node]     (default office; needs build\Release\cdrive.exe and the Miniserver repo's .secrets.env)"""
@@ -73,7 +74,7 @@ ok(s == 200, "test user verified and approved")
 s, r = call("POST", "/api/collections/users/auth-with-password", {"identity": email, "password": pw}); utok = r["token"]
 tmp = tempfile.mkdtemp(prefix="cdrive-")
 A, Bd = os.path.join(tmp, "pcA"), os.path.join(tmp, "pcB"); FA, FB = os.path.join(tmp, "folderA"), os.path.join(tmp, "folderB")
-did = ""
+did = ""; uid2 = ""
 try:
     pair(A, utok, "PC-A"); pair(Bd, utok, "PC-B")
     rc, out = cli(A, "create", "--name", "cd test", "--node", NODE, "--size", "2")
@@ -111,6 +112,29 @@ try:
     s, d = call("GET", f"/api/ms/drive/drives/{did}", token=utok)
     print("   drive on the server:", d.get("used"), "bytes,", d.get("files"), "files, rev", d.get("rev"), "online", d.get("online"))
     ok(s == 200 and d["files"] == 3, f"the node reported the drive ({d.get('files')} files)")
+    # sharing (API.md section 17): a second account, PC-C, gets the drive read only, then editable
+    email2 = f"cdtest2-{uuid.uuid4().hex[:8]}@example.com"; pw2 = secrets.token_urlsafe(16)
+    s, r = call("POST", "/api/collections/users/records", {"email": email2, "password": pw2, "passwordConfirm": pw2, "name": "cd test 2"}); uid2 = r["id"]
+    call("PATCH", f"/api/collections/users/records/{uid2}", {"verified": True, "approved": True}, token=su)
+    s, r = call("POST", "/api/collections/users/auth-with-password", {"identity": email2, "password": pw2}); utok2 = r["token"]
+    C, FC = os.path.join(tmp, "pcC"), os.path.join(tmp, "folderC")
+    pair(C, utok2, "PC-C")
+    rc, out = cli(A, "share", did, email2, "--read"); ok(rc == 0 and "read only" in out, "A shares it read only: " + out[:80])
+    rc, out = cli(C, "drives"); ok(did in out and "shared by " + email in out and "(read only)" in out, "C lists the shared drive")
+    rc, out = cli(C, "use", did, "--folder", FC); ok(rc == 0, out[:80])
+    out = wait_sync(C, 40, "C first sync")
+    ok(open(os.path.join(FC, "docs", "hello.txt")).read() == "A wins?\n" and "read only" in out, "C got the files, read only")
+    open(os.path.join(FC, "fromC.txt"), "w").write("C"); os.remove(os.path.join(FC, "docs", "hello.txt"))
+    out = wait_sync(C, 30, "C read only after its edits")
+    ok(os.path.exists(os.path.join(FC, "docs", "hello.txt")) and "1 local changes not sent" in out, "a delete on C comes back, its new file stays local")
+    out = wait_sync(A, 30)
+    ok(not os.path.exists(os.path.join(FA, "fromC.txt")) and os.path.exists(os.path.join(FA, "docs", "hello.txt")), "nothing of C reached the drive")
+    rc, out = cli(A, "share", did, email2); ok(rc == 0 and "can edit" in out, "A lets C edit: " + out[:80])
+    out = wait_sync(C, 40, "C editable")
+    out = wait_sync(A, 40)
+    ok(os.path.exists(os.path.join(FA, "fromC.txt")), "now C's file reaches A")
+    rc, out = cli(C, "leave", did); ok(rc == 0, "C leaves: " + out[:60])
+    rc, out = cli(C, "drives"); ok(did not in out, "gone from C's drives")
     print("ALL OK (ChronoDrive end to end on node " + NODE + ")")
 finally:
     if did and A in HOMES:
@@ -118,5 +142,7 @@ finally:
     if did:
         call("DELETE", f"/api/ms/drive/drives/{did}", token=utok)
     call("DELETE", f"/api/collections/users/records/{uid}", token=su)
+    if uid2:
+        call("DELETE", f"/api/collections/users/records/{uid2}", token=su)
     shutil.rmtree(tmp, ignore_errors=True)
     print("cleaned up (the drive is marked deleting: the office agent removes its folder)")
