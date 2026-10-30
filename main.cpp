@@ -25,7 +25,7 @@ constexpr UINT WM_APP_RESULT = WM_APP + 1;
 constexpr UINT WM_APP_TRAY = WM_APP + 3;
 constexpr UINT WM_APP_HUB = WM_APP + 4;      // a command from ChronoScan Tools (hubpipe.hpp): lparam = json*
 constexpr UINT kTrayId = 1;
-constexpr int kMaxCards = 6;
+constexpr int kMaxCards = 40;   // the window scrolls; more than this: a line sends to the web page
 enum { kMenuOpen = 101, kMenuPause = 103, kMenuPage = 104, kMenuUpdate = 105, kMenuExit = 109, kMenuDrive = 200 };
 
 static const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -115,6 +115,38 @@ class VLines : public VirtualWidgetImpl {
   }
 };
 
+// the window's scrollbar (chrome, on the right edge): shown when the content is taller than the window; the thumb drags,
+// a click on the track jumps there. The wheel scrolls the window by itself (VirtualWindow).
+class VScrollBar : public VirtualWidgetImpl {
+  VirtualWindow* m_win; float m_viewH = 0, m_grab = -1;
+  bool Need() const { return m_win->GetContentHeight() > m_viewH + 0.5f; }
+  float ThumbH() const { return (std::max)(40.0f, m_viewH * m_viewH / m_win->GetContentHeight()); }
+  float ThumbY() const { float max = m_win->GetContentHeight() - m_viewH; return max > 0 ? (m_viewH - ThumbH()) * m_win->GetScrollY() / max : 0.0f; }
+  void ScrollTo(float thumbTop) { float track = m_viewH - ThumbH(); if (track > 0) m_win->SetScrollY((std::max)(0.0f, thumbTop) / track * (m_win->GetContentHeight() - m_viewH)); }
+ public:
+  explicit VScrollBar(VirtualWindow* w) : m_win(w) {}
+  const char* GetTypeName() const override { return "VScrollBar"; }
+  // bounds reach far above and below the window so a drag outside it keeps viewport coordinates (see DispatchMouseMove)
+  void Place(float right, float viewH) { m_viewH = viewH; SetBounds(vd::Rect(right - 14, -100000.0f, 14, 200000.0f)); }
+  bool HitTest(float x, float y) const override { return Need() && x >= m_bounds.left && x < m_bounds.right && y >= 0 && y < m_viewH; }
+  void OnDraw(ID2D1RenderTarget* rt) override {
+    if (!Need()) return;
+    float w = m_hovered || m_grab >= 0 ? 8.0f : 5.0f;
+    vd::Fill(rt, vd::Rect(m_bounds.right - 4 - w, ThumbY() + 4, w, ThumbH() - 8), m_grab >= 0 ? vctl::Muted() : vctl::Border(), w / 2);
+  }
+  VInputResult OnMouseEnter() override { m_hovered = true; return VInputResult::Handled; }
+  VInputResult OnMouseLeave() override { m_hovered = false; return VInputResult::Handled; }
+  VInputResult OnMouseDown(float, float y, int) override {
+    if (!Need()) return VInputResult::NotHandled;
+    float t = ThumbY(), h = ThumbH();
+    m_grab = y >= t && y < t + h ? y - t : h / 2;
+    ScrollTo(y - m_grab);
+    return VInputResult::Capture;
+  }
+  VInputResult OnMouseMove(float, float y) override { if (m_grab < 0) return VInputResult::NotHandled; ScrollTo(y - m_grab); return VInputResult::Handled; }
+  VInputResult OnMouseUp(float, float, int) override { m_grab = -1; return VInputResult::Handled; }
+};
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   lockDpiAwareness();
   bool trayStart = false, justUpdated = false; std::string showId;   // --show <drive id>: open that drive's "show on this PC" panel; --updated: the setup restarted us
@@ -144,11 +176,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   cd::DriveSet set(cfg, sec.Get("device_secret"));
   json drives = json::array();                    // the account's drives (from the Miniserver)
   std::string linkCode, linkSecret, linkUrl, mapId, serverNote; bool busy = false, loaded = false; float tick = 0.9f, tick30 = 0;
+  bool revealPanel = false;   // a panel just opened under a card: the next layout scrolls it into view
   // updates (updater.hpp): checked 1 minute after start and every 6 hours; a newer setup is downloaded and verified in
   // the background, and installed when every drive is up to date (the setup closes this app and starts it again)
   std::string updNote = justUpdated ? std::string("Updated to ") + CD_VERSION_STR : ""; std::wstring updSetup; std::string updVersion; bool updBusy = false; float updTick = 6 * 3600 - 60;
   auto linked = [&] { return !cfg.device_id.empty() && !sec.Get("device_secret").empty(); };
 
+  auto* scrollBar = win.AddChrome<VScrollBar>(&win);   // before the dialogs: they cover it
   auto* msgDlg = win.AddChrome<VDialog>(); msgDlg->Attach(&win); msgDlg->Primary(L"OK");
   auto showMsg = [&](const std::wstring& t, const std::wstring& b) { msgDlg->Title(t).Body(b); msgDlg->Open(); repaint(); };
   auto* confirmDlg = win.AddChrome<VDialog>(); confirmDlg->Attach(&win); confirmDlg->Primary(L"Remove").CloseText(L"Cancel").Accent(D2D1::ColorF(0xDC2626));
@@ -171,6 +205,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   auto* newBtn = ghost(win.Add<VButton>()); newBtn->Text(L"New drive\x2026");
   auto* refreshBtn = ghost(win.Add<VButton>()); refreshBtn->Text(L"Refresh");
   auto* emptyLbl = win.Add<VLabel>(); emptyLbl->Text(L"").FontSize(14.0f).Muted(true);
+  auto* moreLbl = win.Add<VLabel>(); moreLbl->Text(L"").FontSize(14.0f).Muted(true);
   VDriveCard* cards[kMaxCards]; VButton* mainBtn[kMaxCards]; VButton* pauseBtn[kMaxCards]; VButton* removeBtn[kMaxCards]; VButton* shareBtn[kMaxCards];
   for (int i = 0; i < kMaxCards; ++i) {
     cards[i] = win.Add<VDriveCard>();
@@ -238,6 +273,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     auto vis = visibleDrives();
     emptyLbl->Text(!paired ? L"" : !loaded ? L"Loading your drives\x2026" : vis.empty() ? L"You have no drive yet. \"New drive\x2026\" creates one on the web." : L"");
     emptyLbl->SetVisible(paired && !emptyLbl->GetText().empty());
+    moreLbl->SetVisible(paired && (int)vis.size() > kMaxCards);
+    if (moreLbl->IsVisible()) moreLbl->Text(std::to_wstring(vis.size() - kMaxCards) + L" more drives: see them on the ChronoDrive web page (\"New drive\x2026\").");
     for (int i = 0; i < kMaxCards; ++i) {
       bool on = paired && i < (int)vis.size();
       cards[i]->SetVisible(on); mainBtn[i]->SetVisible(on); pauseBtn[i]->SetVisible(false); removeBtn[i]->SetVisible(false); shareBtn[i]->SetVisible(on);
@@ -367,7 +404,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     if (items.empty()) items.push_back(L"(none free)");
     letterCombo->Items(items).Select(0);
     folderBox->SetText(cd::JoinPath(cd::JoinPath(cd::EnvW(L"USERPROFILE"), L"ChronoDrive"), cd::SafeName(driveName(id))));
-    mapModeSel = 0; mapMode->Set(0);
+    mapModeSel = 0; mapMode->Set(0); revealPanel = true;
     fill(); repaint();
   };
   auto idAt = [&](int i) { auto vis = visibleDrives(); return i < (int)vis.size() ? vis[(size_t)i].value("id", std::string()) : std::string(); };
@@ -417,7 +454,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   for (int i = 0; i < kMaxCards; ++i) shareBtn[i]->OnClick([&, i] {
     std::string id = idAt(i); if (id.empty()) return;
     json d = driveById(id);
-    if (d.value("owner", true)) { mapId.clear(); shareId = shareId == id ? "" : id; shareNote.clear(); shareNoteBad = false; shareEmail->SetText(L""); shareRoleSel = 0; shareRole->Set(0); fill(); repaint(); return; }
+    if (d.value("owner", true)) { mapId.clear(); shareId = shareId == id ? "" : id; shareNote.clear(); shareNoteBad = false; shareEmail->SetText(L""); shareRoleSel = 0; shareRole->Set(0); revealPanel = !shareId.empty(); fill(); repaint(); return; }
     std::string name = d.value("name", ""), owner = d.value("owner_email", "");
     confirmDlg->Title(L"Leave \"" + W(name) + L"\"?").Body(L"It stops syncing on this PC (the files here stay) and goes from your drives. " + W(owner) + L" can share it with you again.").Primary(L"Leave");
     onConfirm = [&, id, name] {
@@ -486,7 +523,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     }
     drivesTitle->SetBounds(vd::Rect(pad, y, 200, 26)); newBtn->SetBounds(vd::Rect(Wd - pad - 120, y - 2, 120, 32)); refreshBtn->SetBounds(vd::Rect(Wd - pad - 232, y - 2, 100, 32)); y += 40;
     if (emptyLbl->IsVisible()) { emptyLbl->SetBounds(vd::Rect(pad, y, cw, 22)); y += 34; }
-    auto vis = visibleDrives();
+    auto vis = visibleDrives(); float panelBottom = 0;
     for (int i = 0; i < kMaxCards; ++i) {
       if (!cards[i]->IsVisible()) continue;
       const float ch = cards[i]->d.share.empty() ? 90.0f : 112.0f;
@@ -507,7 +544,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         folderBox->SetBounds(vd::Rect(px, py + 58, cw - 220, 36)); browseBtn->SetBounds(vd::Rect(px + cw - 210, py + 60, 110, 32));
         mapHint->SetBounds(vd::Rect(px, py + 104, cw - 320, 40));
         mapCancel->SetBounds(vd::Rect(Wd - pad - 16 - 100, py + ph - 48, 100, 34)); mapOk->SetBounds(vd::Rect(Wd - pad - 16 - 220, py + ph - 48, 110, 34));
-        y += ph + 12;
+        y += ph + 12; panelBottom = y;
       }
       if (i < (int)vis.size() && vis[(size_t)i].value("id", "") == shareId && sharePanel->IsVisible()) {
         int rows = 0; for (int k = 0; k < kMaxMembers; ++k) if (memberLbl[k]->IsVisible()) ++rows;
@@ -520,13 +557,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         float ry = py + 96;
         for (int k = 0; k < kMaxMembers; ++k) { if (!memberLbl[k]->IsVisible()) continue; memberLbl[k]->SetBounds(vd::Rect(px, ry + 5, inner - 110, 22)); memberDel[k]->SetBounds(vd::Rect(px + inner - 96, ry, 96, 30)); ry += 34; }
         shareWeb->SetBounds(vd::Rect(px, py + ph - 46, 170, 34)); shareClose->SetBounds(vd::Rect(Wd - pad - 16 - 100, py + ph - 46, 100, 34));
-        y += ph + 12;
+        y += ph + 12; panelBottom = y;
       }
     }
-    float by = (std::max)(y + 10, H - 250.0f);
-    recentTitle->SetBounds(vd::Rect(pad, by, cw, 22)); recent->SetBounds(vd::Rect(pad, by + 30, cw, (std::max)(22.0f, H - by - 30 - 60)));
-    autostartChk->SetBounds(vd::Rect(pad, H - 44, 220, 26)); logBtn->SetBounds(vd::Rect(Wd - pad - 70, H - 46, 70, 30));
-    footer->SetBounds(vd::Rect(pad + 230, H - 40, cw - 320, 20));
+    if (moreLbl->IsVisible()) { moreLbl->SetBounds(vd::Rect(pad, y, cw, 22)); y += 34; }
+    // recent changes and the footer: at the window's bottom, or after the cards when they do not fit (then it scrolls)
+    float by = (std::max)(y + 10, H - 250.0f), bottom = by + 250.0f;
+    recentTitle->SetBounds(vd::Rect(pad, by, cw, 22)); recent->SetBounds(vd::Rect(pad, by + 30, cw, 160));
+    autostartChk->SetBounds(vd::Rect(pad, bottom - 44, 220, 26)); logBtn->SetBounds(vd::Rect(Wd - pad - 70, bottom - 46, 70, 30));
+    footer->SetBounds(vd::Rect(pad + 230, bottom - 40, cw - 320, 20));
+    win.SetContentHeight(bottom); scrollBar->Place(Wd, H);
+    if (revealPanel && panelBottom > 0) { revealPanel = false; if (panelBottom > win.GetScrollY() + H) win.SetScrollY(panelBottom - H); }
     msgDlg->Cover(Wd, H); confirmDlg->Cover(Wd, H);
   };
   relayout = [&] { layout(); };
