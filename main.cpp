@@ -222,7 +222,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     if (!set.Running(m.id)) { key = "error"; return at + L"   \x00b7   not syncing"; }
     if (st.state == "idle" && st.readOnly) return at + L"   \x00b7   Up to date, read only" + (st.localOnly ? L"   \x00b7   " + std::to_wstring(st.localOnly) + (st.localOnly == 1 ? L" change of yours stays on this PC" : L" changes of yours stay on this PC") : L"");
     if (st.state == "idle") return at + L"   \x00b7   Up to date";
-    if (st.state == "syncing") return at + L"   \x00b7   Syncing" + (st.pending ? L", " + std::to_wstring(st.pending) + L" left" : L"") + (st.bytesTotal ? L" (" + W(cd::Human(st.bytesDone)) + L" of " + W(cd::Human(st.bytesTotal)) + L")" : L"");
+    if (st.state == "syncing") return at + L"   \x00b7   " + W(cd::ProgressText(st));
     if (st.state == "paused") return at + L"   \x00b7   Paused";
     if (st.state == "offline") { detail = st.detail.empty() ? L"" : L"   " + W(st.detail); return at + L"   \x00b7   Waiting"; }
     if (st.state == "error") { detail = L"   " + W(st.detail); return at + L"   \x00b7   Stopped"; }
@@ -297,7 +297,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
       json ds = json::array();
       for (auto& m : cfg.maps) {
         auto st = set.Status(m.id); bool run = set.Running(m.id);
-        ds.push_back({{"id", m.id}, {"name", m.name}, {"at", U(cd::ShownAt(m))}, {"state", run ? st.state : "error"}, {"detail", run ? st.detail : "not syncing"}, {"pending", st.pending}, {"paused", m.paused}});
+        ds.push_back({{"id", m.id}, {"name", m.name}, {"at", U(cd::ShownAt(m))}, {"state", run ? st.state : "error"}, {"detail", run ? st.detail : "not syncing"}, {"pending", st.pending}, {"paused", m.paused},
+                      {"phase", st.phase}, {"bytes_done", st.bytesDone}, {"bytes_total", st.bytesTotal}, {"rate", st.rate}, {"progress", st.state == "syncing" ? cd::ProgressText(st) : ""}});
       }
       hubPipe.Publish({{"version", CD_VERSION_STR}, {"paired", linked()}, {"email", cfg.email}, {"overall", cfg.maps.empty() ? "setup" : all}, {"drives", ds}});
     }

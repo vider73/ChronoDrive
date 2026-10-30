@@ -1,6 +1,6 @@
 ; ChronoDrive installer (Inno Setup 6). The version below is the ONLY place it lives: CMake reads it.
 #define AppName "ChronoDrive"
-#define AppVersion "0.3.1"
+#define AppVersion "0.4.0"
 #define Root ".."
 #ifndef BUILDDIR
 #define BUILDDIR "build\Release"

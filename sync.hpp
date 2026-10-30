@@ -2,6 +2,8 @@
 //   index.json   what this PC last saw of every path: size, mtime, sha256, the drive's rev (the base rev of the next write)
 //   remote pass  the drive's change feed since the index rev: downloads, folders, deletes (to the Recycle Bin), conflicts
 //   local pass   the folder against the index: uploads (small put or chunked), deletes, folders
+// Files go up and come down a few at a time (Config::workers threads, kWorkers by default): deletes go first and one by
+// one, folders before their files; the index is shared by the workers behind m_ix.
 // Rules: a remote change over an untouched local file wins; a local change over an untouched remote file wins; both
 // changed = the remote version keeps the name and the local one is kept (and uploaded) as "name (conflict PC date).ext".
 // Nothing is ever lost silently. Design: the Miniserver's docs/chronodrive.md section 3.4.
@@ -42,12 +44,24 @@ struct RecentChange { time_t at; std::string what, path, by; };
 struct SyncStatus {
   std::string state = "setup";    // setup | connecting | syncing | idle | paused | offline | error
   std::string detail, nodeUrl;
-  int pending = 0; uint64_t bytesDone = 0, bytesTotal = 0;
+  int pending = 0; uint64_t bytesDone = 0, bytesTotal = 0;   // while syncing: files left, bytes moved of this phase's bytes
+  std::string phase;              // while syncing: "up" (uploading) | "down" (downloading) | "" (checking)
+  double rate = 0;                // files per second in this phase
   time_t lastSync = 0;
   bool readOnly = false;          // shared with this account to read only: nothing goes up
   int localOnly = 0;              // read only: files new or changed here that stay on this PC
   std::deque<RecentChange> recent;
 };
+
+// "Uploading, 1,234 files left (40.2 MB of 2.10 GB), 25 files/s": the card, the hub and cdrive sync
+inline std::string Thousands(int64_t n) { std::string s = std::to_string(n); for (int i = (int)s.size() - 3; i > (n < 0 ? 1 : 0); i -= 3) s.insert((size_t)i, ","); return s; }
+inline std::string ProgressText(const SyncStatus& st) {
+  std::string t = st.phase == "up" ? "Uploading" : st.phase == "down" ? "Downloading" : "Syncing";
+  if (st.pending) t += ", " + Thousands(st.pending) + (st.pending == 1 ? " file left" : " files left");
+  if (st.bytesTotal) t += " (" + Human((std::min)(st.bytesDone, st.bytesTotal)) + " of " + Human(st.bytesTotal) + ")";
+  if (st.rate >= 0.1) { char b[32]; snprintf(b, sizeof b, st.rate < 10 ? "%.1f" : "%.0f", st.rate); t += std::string(", ") + b + " files/s"; }
+  return t;
+}
 
 // ------------------------------------------------------------------ local folder helpers
 struct LocalFile { std::string path; bool dir = false; uint64_t size = 0; int64_t mtime = 0; };
@@ -106,7 +120,14 @@ class Engine {
   void Pause(bool on) { m_paused = on; Kick(); }
   bool Paused() const { return m_paused; }
   void Kick() { { std::lock_guard<std::mutex> lk(m_mx); m_dirty = true; } m_cv.notify_all(); }
-  SyncStatus Status() { std::lock_guard<std::mutex> lk(m_smx); return m_status; }
+  SyncStatus Status() {
+    std::lock_guard<std::mutex> lk(m_smx); SyncStatus s = m_status;
+    if (s.state == "syncing") {
+      s.pending = (int)(std::max)((int64_t)0, (int64_t)m_left); s.bytesDone = m_bdone; s.bytesTotal = m_btotal; s.phase = m_phase;
+      double secs = (NowMs() - m_phaseAt) / 1000.0; if (!m_phase.empty() && secs >= 2) s.rate = m_fdone / secs;
+    }
+    return s;
+  }
   const Config& Cfg() const { return m_cfg; }
 
  private:
@@ -115,6 +136,12 @@ class Engine {
   std::mutex m_mx; std::condition_variable m_cv;
   std::thread m_worker, m_watcher, m_poller;
   std::mutex m_smx; SyncStatus m_status;
+  std::mutex m_ix;                                   // m_idx, shared by the workers of a pass
+  int64_t m_lastSave = 0, m_saveGap = 2000;          // throttled saves: at most every m_saveGap ms (10x the last save's time)
+  std::atomic<int64_t> m_left{0}, m_fdone{0}; std::atomic<uint64_t> m_bdone{0}, m_btotal{0};
+  std::string m_phase; int64_t m_phaseAt = 0;        // under m_smx
+  int64_t m_headRev = 0;                             // the drive's rev when it last answered (for "files left" while pulling)
+  int m_workers = kWorkers;
   Index m_idx; DriveClient m_dc; std::string m_grantUrls; time_t m_grantExp = 0, m_lastUrlCheck = 0; json m_urls; std::string m_certSha; bool m_readOnly = false;
   std::wstring m_root; std::string m_pc;
 
@@ -122,7 +149,38 @@ class Engine {
   void Note(const std::string& what, const std::string& path, const std::string& by = "") {
     std::lock_guard<std::mutex> lk(m_smx); m_status.recent.push_front({Now(), what, path, by}); while (m_status.recent.size() > 20) m_status.recent.pop_back();
   }
-  void Progress(int pending, uint64_t done, uint64_t total) { std::lock_guard<std::mutex> lk(m_smx); m_status.pending = pending; m_status.bytesDone = done; m_status.bytesTotal = total; }
+  // progress of a pass: a phase ("up", "down") says how many files are left and adds its bytes; each finished file counts
+  void Phase(const std::string& ph, int64_t files, uint64_t bytes) {
+    std::lock_guard<std::mutex> lk(m_smx);
+    if (m_phase != ph) { m_phase = ph; m_phaseAt = NowMs(); m_fdone = 0; m_bdone = 0; m_btotal = 0; }
+    m_left = files; m_btotal += bytes;
+  }
+  void NoPhase() { std::lock_guard<std::mutex> lk(m_smx); m_phase.clear(); m_left = 0; m_fdone = 0; m_bdone = 0; m_btotal = 0; }
+  void FileDone(uint64_t bytes) { --m_left; ++m_fdone; m_bdone += bytes; }
+  void SaveIndex(bool force) {   // a big index (100k files) takes a while to write: not after every file
+    std::lock_guard<std::mutex> lk(m_ix);
+    int64_t t = NowMs(); if (!force && t - m_lastSave < m_saveGap) return;
+    m_idx.Save(); m_lastSave = NowMs(); m_saveGap = (std::max)((int64_t)2000, 10 * (m_lastSave - t));
+  }
+  // ---- work(i) for i in [0, n) on up to m_workers threads. A false (or a throw) stops the others taking new ones; the
+  // first error lands in err.
+  bool Parallel(size_t n, const std::function<bool(size_t, std::string&)>& work, std::string& err) {
+    std::atomic<size_t> next{0}; std::atomic<bool> stop{false}; std::mutex emx; std::string first;
+    auto run = [&] {
+      while (!stop && m_run) {
+        size_t i = next++; if (i >= n) return;
+        std::string e; bool ok = false;
+        try { ok = work(i, e); } catch (std::exception& ex) { e = ex.what(); }
+        if (!ok) { std::lock_guard<std::mutex> lk(emx); if (first.empty()) first = e.empty() ? "failed" : e; stop = true; }
+      }
+    };
+    size_t k = (std::min)(n, (size_t)m_workers);
+    if (k <= 1) run();
+    else { std::vector<std::thread> ts; for (size_t t = 0; t < k; ++t) ts.emplace_back(run); for (auto& t : ts) t.join(); }
+    if (!first.empty()) { err = first; return false; }
+    if (!m_run) { err = "stopped"; return false; }
+    return true;
+  }
 
   // ---- grant and the node's url (every 10 minutes, and whenever a call fails)
   bool Connect(std::string& err) {
@@ -142,7 +200,7 @@ class Engine {
     for (auto& u : m_urls) {
       DriveClient dc; dc.grant = m_dc.grant; dc.base = u.value("url", ""); dc.pin = u.value("lan", false) ? m_certSha : "";
       std::string e; json info = dc.Info(e);
-      if (!info.is_null()) { if (m_dc.base != dc.base) Log("drive at " + dc.base); m_dc = dc; { std::lock_guard<std::mutex> lk(m_smx); m_status.nodeUrl = dc.base; } return true; }
+      if (!info.is_null()) { if (m_dc.base != dc.base) Log("drive at " + dc.base); m_dc = dc; m_headRev = info.value("rev", (int64_t)0); { std::lock_guard<std::mutex> lk(m_smx); m_status.nodeUrl = dc.base; } return true; }
       if (e.find("http 403") != std::string::npos) { SetState("error", "The drive refuses this PC: " + e); return false; }
       Log("drive url " + dc.base + ": " + e);
     }
@@ -152,17 +210,34 @@ class Engine {
   }
 
   // ---- remote pass: the change feed since the index rev
+  // A page of changes: folders and files a few at a time; a delete waits for everything before it and goes alone (a
+  // folder's delete after its files' changes, a file under a deleted folder after the delete). The index rev moves past
+  // a run only when all of it is done; what was done of a failed run is in the index and skipped next time.
   bool PullRemote(std::string& err) {
     for (;;) {
-      json r = m_dc.Changes(m_idx.rev, 0, err);
+      int64_t since; { std::lock_guard<std::mutex> lk(m_ix); since = m_idx.rev; }
+      json r = m_dc.Changes(since, 0, err);
       if (r.is_null()) return false;
       std::vector<Entry> list; for (auto& c : r.value("changes", json::array())) list.push_back(EntryOf(c));
-      if (!list.empty()) Log("changes since " + std::to_string(m_idx.rev) + ": " + std::to_string(list.size()) + " (up to rev " + std::to_string(list.back().rev) + ")");
-      if (list.empty()) { m_idx.rev = (std::max)(m_idx.rev, r.value("rev", m_idx.rev)); return true; }
-      Progress((int)list.size(), 0, 0);
-      for (auto& e : list) { if (!m_run) return false; Apply(e); m_idx.rev = (std::max)(m_idx.rev, e.rev); }
-      m_idx.Save();
-      if (!r.value("more", false)) return true;
+      if (!list.empty()) Log("changes since " + std::to_string(since) + ": " + std::to_string(list.size()) + " (up to rev " + std::to_string(list.back().rev) + ")");
+      if (list.empty()) { std::lock_guard<std::mutex> lk(m_ix); m_idx.rev = (std::max)(m_idx.rev, r.value("rev", m_idx.rev)); return true; }
+      bool more = r.value("more", false);
+      m_headRev = (std::max)(m_headRev, list.back().rev);
+      uint64_t bytes = 0; for (auto& e : list) if (!e.deleted && e.kind != "dir") bytes += e.size;
+      Phase("down", (int64_t)list.size() + (more ? m_headRev - list.back().rev : 0), bytes);
+      auto setRev = [&](int64_t v) { std::lock_guard<std::mutex> lk(m_ix); m_idx.rev = (std::max)(m_idx.rev, v); };
+      for (size_t i = 0; i < list.size();) {
+        if (!m_run) return false;
+        if (list[i].deleted) { Apply(list[i]); FileDone(0); setRev(list[i].rev); ++i; continue; }
+        size_t j = i; while (j < list.size() && !list[j].deleted) ++j;
+        // folders first (local, quick), then the files on the workers
+        std::vector<const Entry*> files;
+        for (size_t k = i; k < j; ++k) { if (list[k].kind == "dir") { Apply(list[k]); FileDone(0); } else files.push_back(&list[k]); }
+        if (!Parallel(files.size(), [&](size_t k, std::string&) { Apply(*files[k]); FileDone(files[k]->size); return true; }, err)) { SaveIndex(true); throw std::runtime_error(err); }
+        setRev(list[j - 1].rev); i = j;
+      }
+      SaveIndex(true);
+      if (!more) return true;
     }
   }
   bool LocalUnchanged(const std::string& path, const IndexEntry& ie, bool* exists) {
@@ -171,31 +246,35 @@ class Engine {
     if (ie.dir) return f.dir;
     return !f.dir && f.size == ie.size && f.mtime / 1000 == ie.mtime / 1000;
   }
+  void SetEntry(const std::string& path, const IndexEntry& ie) { std::lock_guard<std::mutex> lk(m_ix); m_idx.files[path] = ie; }
+  // One change from the feed. Safe on the workers for different paths: the index behind m_ix, never held across I/O.
   void Apply(const Entry& e) {
-    auto it = m_idx.files.find(e.path);
-    if (it != m_idx.files.end() && e.rev <= it->second.rev) return;   // ours, or already seen
+    IndexEntry cur; bool known;
+    { std::lock_guard<std::mutex> lk(m_ix); auto it = m_idx.files.find(e.path); known = it != m_idx.files.end(); if (known) cur = it->second; }
+    if (known && e.rev <= cur.rev) return;   // ours, or already seen
     std::wstring local = ToLocal(m_root, e.path);
     if (e.deleted) {
-      bool exists = false, same = it == m_idx.files.end() ? true : LocalUnchanged(e.path, it->second, &exists);
-      if (it == m_idx.files.end()) { return; }   // never had it
+      if (!known) { return; }   // never had it
+      bool exists = false, same = LocalUnchanged(e.path, cur, &exists);
       if (exists && same) { Recycle(local); Note("deleted on " + (e.by.empty() ? std::string("the drive") : e.by), e.path, e.by); }
       else if (exists) Log("kept local changes of " + e.path + " (deleted on the drive): it goes up again");
       // entries under a deleted folder go too
+      std::lock_guard<std::mutex> lk(m_ix);
       std::vector<std::string> under; for (auto& [p, ie] : m_idx.files) if (p == e.path || p.rfind(e.path + "/", 0) == 0) under.push_back(p);
       for (auto& p : under) m_idx.files.erase(p);
       return;
     }
     if (e.kind == "dir") {
       EnsureDir(local);
-      IndexEntry ie; ie.dir = true; ie.rev = e.rev; m_idx.files[e.path] = ie; return;
+      IndexEntry ie; ie.dir = true; ie.rev = e.rev; SetEntry(e.path, ie); return;
     }
     // a file: download unless the local copy already is this content
     LocalFile f; bool exists = StatLocal(local, f);
     if (exists && !f.dir) {
-      std::string sha; if ((it == m_idx.files.end() || !LocalUnchanged(e.path, it->second, nullptr)) && Sha256File(local, sha) && sha == e.sha256) {
-        IndexEntry ie; ie.size = e.size; ie.mtime = e.mtime; ie.sha256 = e.sha256; ie.rev = e.rev; m_idx.files[e.path] = ie; SetMtime(local, e.mtime); return;
+      std::string sha; if ((!known || !LocalUnchanged(e.path, cur, nullptr)) && Sha256File(local, sha) && sha == e.sha256) {
+        IndexEntry ie; ie.size = e.size; ie.mtime = e.mtime; ie.sha256 = e.sha256; ie.rev = e.rev; SetEntry(e.path, ie); SetMtime(local, e.mtime); return;
       }
-      if (it != m_idx.files.end() && !LocalUnchanged(e.path, it->second, nullptr) || it == m_idx.files.end()) {
+      if (known && !LocalUnchanged(e.path, cur, nullptr) || !known) {
         // changed here too (or unknown to the index): keep ours as a conflict copy, it goes up in the local pass
         std::string cname = ConflictName(e.path, m_pc);
         if (MoveFileExW(LongPath(local).c_str(), LongPath(ToLocal(m_root, cname)).c_str(), MOVEFILE_REPLACE_EXISTING)) { Log("conflict on " + e.path + ": local copy kept as " + cname); Note("conflict, local copy kept", cname, e.by); }
@@ -213,7 +292,7 @@ class Engine {
     if (!Sha256File(part, sha, &size) || (size != e.size) || (sha != e.sha256)) { DeleteFileW(LongPath(part).c_str()); Log("download " + e.path + ": hash mismatch, retried later"); throw std::runtime_error("hash mismatch on " + e.path); }
     if (!MoveFileExW(LongPath(part).c_str(), LongPath(local).c_str(), MOVEFILE_REPLACE_EXISTING)) { Log("cannot replace " + e.path + " (open in another program?): " + LastErrorText()); throw std::runtime_error("file busy: " + e.path); }
     SetMtime(local, e.mtime);
-    IndexEntry ie; ie.size = e.size; ie.mtime = e.mtime; ie.sha256 = e.sha256; ie.rev = e.rev; m_idx.files[e.path] = ie;
+    IndexEntry ie; ie.size = e.size; ie.mtime = e.mtime; ie.sha256 = e.sha256; ie.rev = e.rev; SetEntry(e.path, ie);
     Note("downloaded", e.path, e.by);
   }
 
@@ -229,31 +308,38 @@ class Engine {
       if (it == m_idx.files.end() || it->second.dir || it->second.size != f.size || it->second.mtime / 1000 != f.mtime / 1000) { ups.push_back(f); total += f.size; }
     }
     std::vector<std::string> gone; for (auto& [p, ie] : m_idx.files) if (!seen.count(p)) gone.push_back(p);
-    uint64_t done = 0; int pending = (int)ups.size() + (int)gone.size();
-    Progress(pending, 0, total);
-    // deletes first, deepest paths first (a folder after its files)
+    if (ups.empty() && gone.empty()) return true;
+    Phase("up", (int64_t)ups.size() + (int64_t)gone.size(), total);
+    // deletes first and one by one, deepest paths first (a folder after its files)
     std::sort(gone.begin(), gone.end(), [](const std::string& a, const std::string& b) { return a.size() > b.size(); });
     std::set<std::string> dropped;
     for (auto& p : gone) {
       if (!m_run) return false;
-      if (dropped.count(p)) continue;
+      if (dropped.count(p)) { FileDone(0); continue; }
       auto ie = m_idx.files[p]; int status = 0; std::string e;
       json r = m_dc.Delete(p, ie.rev, e, &status);
       if (status == 200 || status == 404) { if (status == 200) Note("deleted", p); }
       else if (status == 412) { Log("delete " + p + ": changed on the drive meanwhile, it comes back down"); }
       else { err = e; return false; }
+      std::lock_guard<std::mutex> lk(m_ix);
       for (auto& [q, x] : m_idx.files) if (q == p || q.rfind(p + "/", 0) == 0) dropped.insert(q);
-      m_idx.files.erase(p); Progress(--pending, done, total);
+      m_idx.files.erase(p); FileDone(0);
     }
-    for (auto& q : dropped) m_idx.files.erase(q);
-    for (auto& f : ups) {
-      if (!m_run) return false;
-      std::string e;
-      if (f.dir) { json r = m_dc.Mkdir(f.path, e); if (r.is_null()) { err = e; return false; } IndexEntry ie; ie.dir = true; ie.rev = r.value("rev", (int64_t)0); m_idx.files[f.path] = ie; Progress(--pending, done, total); continue; }
-      if (!Upload(f, e)) { if (e == "busy") { Progress(--pending, done, total); continue; } err = e; return false; }
-      done += f.size; Progress(--pending, done, total);
-      m_idx.Save();
+    { std::lock_guard<std::mutex> lk(m_ix); for (auto& q : dropped) m_idx.files.erase(q); }
+    // folders before their files: level by level (the folders of one level at once), then every file on the workers
+    std::vector<LocalFile> fs; std::map<size_t, std::vector<LocalFile>> levels;
+    for (auto& f : ups) { if (f.dir) levels[(size_t)std::count(f.path.begin(), f.path.end(), '/')].push_back(f); else fs.push_back(f); }
+    for (auto& level : levels) {
+      auto& dirs = level.second;   // a named reference: a lambda cannot capture a structured binding in C++17
+      if (!Parallel(dirs.size(), [&](size_t i, std::string& e) {
+            json r = m_dc.Mkdir(dirs[i].path, e); if (r.is_null()) return false;
+            IndexEntry ie; ie.dir = true; ie.rev = r.value("rev", (int64_t)0); SetEntry(dirs[i].path, ie); FileDone(0); return true; }, err)) return false;
     }
+    if (!Parallel(fs.size(), [&](size_t i, std::string& e) {
+          if (!Upload(fs[i], e)) { if (e != "busy") return false; FileDone(0); return true; }
+          FileDone(fs[i].size > kSmallMax ? 0 : fs[i].size);   // a chunked upload counted its bytes chunk by chunk
+          SaveIndex(false);
+          return true; }, err)) return false;
     return true;
   }
   // ---- a drive shared to read only: nothing goes up. Files deleted here come back from the drive; files new or changed
@@ -267,13 +353,14 @@ class Engine {
       auto it = m_idx.files.find(f.path);
       if (it == m_idx.files.end() || it->second.dir || it->second.size != f.size || it->second.mtime / 1000 != f.mtime / 1000) ++localOnly;
     }
-    std::vector<std::pair<std::string, IndexEntry>> missing; for (auto& [p, ie] : m_idx.files) if (!seen.count(p)) missing.push_back({p, ie});
+    std::vector<std::pair<std::string, IndexEntry>> missing;
+    { std::lock_guard<std::mutex> lk(m_ix); for (auto& [p, ie] : m_idx.files) if (!seen.count(p)) missing.push_back({p, ie}); }
     std::sort(missing.begin(), missing.end(), [](const auto& a, const auto& b) { return a.first.size() < b.first.size(); });   // folders before their files
     for (auto& [p, ie] : missing) {
       if (!m_run) return false;
       if (ie.dir) { EnsureDir(ToLocal(m_root, p)); continue; }
       Entry e; e.path = p; e.rev = ie.rev; e.kind = "file"; e.size = ie.size; e.mtime = ie.mtime; e.sha256 = ie.sha256;
-      m_idx.files.erase(p); Apply(e);   // downloads it again (Apply notes "downloaded")
+      { std::lock_guard<std::mutex> lk(m_ix); m_idx.files.erase(p); } Apply(e);   // downloads it again (Apply notes "downloaded")
     }
     { std::lock_guard<std::mutex> lk(m_smx); m_status.localOnly = localOnly; }
     (void)err; return true;
@@ -282,41 +369,56 @@ class Engine {
     std::wstring local = ToLocal(m_root, f.path);
     std::string sha; uint64_t size = 0;
     if (!Sha256File(local, sha, &size)) { Log("cannot read " + f.path + " (open for writing?): retried later"); err = "busy"; return false; }
-    auto it = m_idx.files.find(f.path); int64_t base = it == m_idx.files.end() || it->second.dir ? 0 : it->second.rev;
-    if (it != m_idx.files.end() && !it->second.dir && it->second.sha256 == sha) {   // same content, only the date changed: nothing to send
-      it->second.size = size; it->second.mtime = f.mtime; return true;
+    int64_t base = 0; std::string up;
+    {
+      std::lock_guard<std::mutex> lk(m_ix);
+      auto it = m_idx.files.find(f.path); base = it == m_idx.files.end() || it->second.dir ? 0 : it->second.rev;
+      if (it != m_idx.files.end() && !it->second.dir && it->second.sha256 == sha) {   // same content, only the date changed: nothing to send
+        it->second.size = size; it->second.mtime = f.mtime; return true;
+      }
+      auto u = m_idx.uploads.find(f.path); if (u != m_idx.uploads.end()) up = u->second;
     }
     int status = 0; json r;
     if (size <= kSmallMax) r = m_dc.PutSmall(f.path, local, size, sha, f.mtime, base, err, &status);
     else {
-      std::string up = m_idx.uploads.count(f.path) ? m_idx.uploads[f.path] : "";
       uint64_t off = 0;
       if (!up.empty()) { std::string e2; off = m_dc.UploadOffset(up, e2); if (off == (uint64_t)-1) { up.clear(); off = 0; } }
-      if (up.empty()) { json s = m_dc.UploadStart(f.path, size, sha, f.mtime, base, err, &status); if (s.is_null()) { if (status == 412) return Conflict(f.path, s); return false; } up = s.value("upload", ""); m_idx.uploads[f.path] = up; m_idx.Save(); }
+      if (up.empty()) {
+        json s = m_dc.UploadStart(f.path, size, sha, f.mtime, base, err, &status); if (s.is_null()) { if (status == 412) return Conflict(f, sha, size, s); return false; }
+        up = s.value("upload", ""); { std::lock_guard<std::mutex> lk(m_ix); m_idx.uploads[f.path] = up; } SaveIndex(true);
+      }
+      m_bdone += off;
       while (off < size) {
         if (!m_run) { err = "stopped"; return false; }
         uint64_t len = (std::min)((uint64_t)kChunk, size - off), real = 0; std::string e2;
         if (!m_dc.UploadChunk(up, local, off, len, e2, &real)) { if (e2 == "offset mismatch") { off = real; continue; } err = e2; return false; }
-        off += len; { std::lock_guard<std::mutex> lk(m_smx); m_status.bytesDone += len; }
+        off += len; m_bdone += len;
       }
       r = m_dc.UploadCommit(up, base, err, &status);
-      m_idx.uploads.erase(f.path);
-      if (r.is_null() && status != 412) { if (status == 400 || status == 404) m_idx.uploads.erase(f.path); return false; }
+      { std::lock_guard<std::mutex> lk(m_ix); m_idx.uploads.erase(f.path); }
+      if (r.is_null() && status != 412) return false;
     }
-    if (status == 412) return Conflict(f.path, r);
+    if (status == 412) return Conflict(f, sha, size, r);
     if (r.is_null()) return false;
     Entry e = EntryOf(r);
-    IndexEntry ie; ie.size = size; ie.mtime = f.mtime; ie.sha256 = sha; ie.rev = e.rev; m_idx.files[f.path] = ie;
+    IndexEntry ie; ie.size = size; ie.mtime = f.mtime; ie.sha256 = sha; ie.rev = e.rev; SetEntry(f.path, ie);
     Note(base ? "uploaded" : "added", f.path, m_pc);
     return true;
   }
-  bool Conflict(const std::string& path, const json& r) {
+  bool Conflict(const LocalFile& f, const std::string& sha, uint64_t size, const json& r) {
+    // the drive already has this very content (our own write whose index entry was not saved, or the same file put there
+    // from another PC): take its rev, nothing to keep apart
+    json cur = r.is_object() ? r.value("current", json()) : json();
+    if (cur.is_object() && !cur.value("deleted", false) && cur.value("kind", "") == "file" && Lower(cur.value("sha256", "")) == sha) {
+      IndexEntry ie; ie.size = size; ie.mtime = f.mtime; ie.sha256 = sha; ie.rev = cur.value("rev", (int64_t)0); SetEntry(f.path, ie);
+      std::lock_guard<std::mutex> lk(m_ix); m_idx.uploads.erase(f.path); return true;
+    }
     // the drive has a newer version: keep ours as a conflict copy (it goes up on the next pass) and forget the index
     // entry so the remote pass brings the drive's version down
-    std::string cname = ConflictName(path, m_pc);
-    if (MoveFileExW(LongPath(ToLocal(m_root, path)).c_str(), LongPath(ToLocal(m_root, cname)).c_str(), MOVEFILE_REPLACE_EXISTING)) { Log("conflict on " + path + ": local copy kept as " + cname); Note("conflict, local copy kept", cname); }
-    m_idx.files.erase(path); m_idx.uploads.erase(path);
-    (void)r; return true;
+    std::string cname = ConflictName(f.path, m_pc);
+    if (MoveFileExW(LongPath(ToLocal(m_root, f.path)).c_str(), LongPath(ToLocal(m_root, cname)).c_str(), MOVEFILE_REPLACE_EXISTING)) { Log("conflict on " + f.path + ": local copy kept as " + cname); Note("conflict, local copy kept", cname); }
+    std::lock_guard<std::mutex> lk(m_ix); m_idx.files.erase(f.path); m_idx.uploads.erase(f.path);
+    return true;
   }
 
   // ---- threads
@@ -340,7 +442,7 @@ class Engine {
   void Poll() {   // long polls on the change feed: wakes the worker when the drive changed
     while (m_run) {
       if (m_paused || m_dc.grant.empty() || m_dc.base.empty()) { std::this_thread::sleep_for(std::chrono::seconds(2)); continue; }
-      std::string err; int64_t since; { std::lock_guard<std::mutex> lk(m_mx); since = m_idx.rev; }
+      std::string err; int64_t since; { std::lock_guard<std::mutex> lk(m_ix); since = m_idx.rev; }
       DriveClient dc = m_dc; json r = dc.Changes(since, 30, err);
       if (r.is_null()) { std::this_thread::sleep_for(std::chrono::seconds(10)); continue; }
       if (!r.value("changes", json::array()).empty()) { { std::lock_guard<std::mutex> lk(m_mx); m_dirty = true; } m_cv.notify_all(); std::this_thread::sleep_for(std::chrono::seconds(2)); }
@@ -350,6 +452,7 @@ class Engine {
   void Loop() {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     m_root = m_cfg.folder; m_pc = ComputerName();
+    m_workers = (std::max)(1, (std::min)(16, m_cfg.workers ? m_cfg.workers : kWorkers));
     m_idx.path = IndexPathFor(m_cfg.drive_id);
     bool loaded = m_idx.Load();
     Log("index " + std::string(loaded ? "loaded" : "not loaded (fresh start)") + ": rev " + std::to_string(m_idx.rev) + ", " + std::to_string(m_idx.files.size()) + " entries");
@@ -364,13 +467,13 @@ class Engine {
       SetState("connecting", "Looking for the drive's node\xe2\x80\xa6");
       if (!Connect(err)) { std::unique_lock<std::mutex> lk(m_mx); m_cv.wait_for(lk, std::chrono::seconds(backoff)); backoff = (std::min)(300, backoff * 2); continue; }
       backoff = 30;
-      SetState("syncing", "Checking the drive\xe2\x80\xa6");
+      NoPhase(); SetState("syncing", "Checking the drive\xe2\x80\xa6");
       try {
         bool ok = PullRemote(err) && (m_readOnly ? KeepReadOnly(err) : PushLocal(err));
-        m_idx.Save();
+        SaveIndex(true);
         if (!ok) { Log("sync: " + err); SetState("offline", err); m_lastUrlCheck = 0; std::unique_lock<std::mutex> lk(m_mx); m_cv.wait_for(lk, std::chrono::seconds(30)); continue; }
-      } catch (std::exception& ex) { m_idx.Save(); Log(std::string("sync: ") + ex.what()); SetState("offline", ex.what()); std::unique_lock<std::mutex> lk(m_mx); m_cv.wait_for(lk, std::chrono::seconds(30)); continue; }
-      { std::lock_guard<std::mutex> lk(m_smx); m_status.lastSync = Now(); m_status.pending = 0; m_status.bytesDone = m_status.bytesTotal = 0; }
+      } catch (std::exception& ex) { SaveIndex(true); Log(std::string("sync: ") + ex.what()); SetState("offline", ex.what()); std::unique_lock<std::mutex> lk(m_mx); m_cv.wait_for(lk, std::chrono::seconds(30)); continue; }
+      NoPhase(); { std::lock_guard<std::mutex> lk(m_smx); m_status.lastSync = Now(); m_status.pending = 0; m_status.bytesDone = m_status.bytesTotal = 0; }
       SetState("idle", "Up to date");
       lastFull = Now();
       // wait for the watcher (2 s of quiet after the last event), the poller, or the 10-minute full scan

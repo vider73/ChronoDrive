@@ -26,6 +26,7 @@ constexpr const char* kDefaultServer = "https://cs-miniserver.chronoscan.org";
 constexpr const char* kDefaultStandby = "https://cs-miniserver-r.chronoscan.org";
 constexpr size_t kSmallMax = 8u << 20;      // whole-file PUT up to here; chunked uploads past it
 constexpr size_t kChunk = 8u << 20;         // bytes per upload chunk
+constexpr int kWorkers = 6;                 // files uploaded or downloaded at once per drive (Config::workers, 1..16)
 
 // ------------------------------------------------------------------ strings, time, paths
 inline std::wstring Wide(const std::string& s) { if (s.empty()) return L""; int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0); std::wstring w(n, 0); MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n); return w; }
@@ -95,6 +96,7 @@ struct Mapping {
 struct Config {
   std::string url = kDefaultServer, standby, email, device_id, device_name;
   std::vector<Mapping> maps;
+  int workers = 0;                   // files moved at once per drive (0 = the default, kWorkers); CHRONODRIVE_WORKERS wins
   // the engine's view of ONE drive (filled per mapping; legacy single-drive configs load into maps)
   std::string drive_id, drive_name, drive_node, drive_node_kind;
   std::wstring folder;
@@ -105,13 +107,15 @@ inline std::wstring IndexPathFor(const std::string& driveId) { return JoinPath(D
 inline json ToJson(const Mapping& m) { return {{"id", m.id}, {"name", m.name}, {"node", m.node}, {"node_kind", m.node_kind}, {"mode", m.mode}, {"letter", Utf8(m.letter)}, {"folder", Utf8(m.folder)}, {"paused", m.paused}}; }
 inline json ToJson(const Config& c) {
   json maps = json::array(); for (auto& m : c.maps) maps.push_back(ToJson(m));
-  return {{"url", c.url}, {"standby", c.standby}, {"email", c.email}, {"device_id", c.device_id}, {"device_name", c.device_name}, {"drives", maps}};
+  json j = {{"url", c.url}, {"standby", c.standby}, {"email", c.email}, {"device_id", c.device_id}, {"device_name", c.device_name}, {"drives", maps}};
+  if (c.workers) j["workers"] = c.workers;
+  return j;
 }
 inline Config LoadConfig() {
   Config c; std::string s;
   if (ReadTextFile(ConfigPath(), s)) {
     try {
-      json j = json::parse(s); c.url = j.value("url", c.url); c.standby = j.value("standby", ""); c.email = j.value("email", ""); c.device_id = j.value("device_id", ""); c.device_name = j.value("device_name", "");
+      json j = json::parse(s); c.url = j.value("url", c.url); c.standby = j.value("standby", ""); c.email = j.value("email", ""); c.device_id = j.value("device_id", ""); c.device_name = j.value("device_name", ""); c.workers = j.value("workers", 0);
       json maps = j.value("drives", json::array());   // a named copy: iterating a temporary json dangles
       for (auto& x : maps) {
         Mapping m; m.id = x.value("id", ""); m.name = x.value("name", ""); m.node = x.value("node", ""); m.node_kind = x.value("node_kind", "");
@@ -129,6 +133,7 @@ inline Config LoadConfig() {
     } catch (...) {}
   }
   std::wstring env = EnvW(L"MINISERVER_URL"); if (!env.empty()) c.url = Utf8(env);   // the environment wins (the lab rule)
+  std::wstring w = EnvW(L"CHRONODRIVE_WORKERS"); if (!w.empty()) c.workers = _wtoi(w.c_str());
   while (!c.url.empty() && c.url.back() == '/') c.url.pop_back();
   return c;
 }
@@ -194,7 +199,7 @@ struct HttpRequest {
   std::string pinSha256;                      // a home node's certificate (DER SHA-256, hex): trust that one only
 };
 struct HttpResponse {
-  int status = 0; std::string body, error; std::map<std::string, std::string> headers;
+  int status = 0; std::string body, error; std::map<std::string, std::string> headers; DWORD winerr = 0;
   bool ok() const { return status >= 200 && status < 300; }
   bool transport() const { return status == 0 || status == 502 || status == 503 || status == 504; }   // "try the standby" (API.md section 11)
   std::string header(const std::string& k) const { auto it = headers.find(Lower(k)); return it == headers.end() ? "" : it->second; }
@@ -209,17 +214,27 @@ inline void CALLBACK PinCallback(HINTERNET h, DWORD_PTR ctx, DWORD status, LPVOI
   p->checked = true; p->failed = Lower(Sha256Of(cert->pbCertEncoded, cert->cbCertEncoded)) != Lower(p->want);
   CertFreeCertificateContext(cert);
 }
-inline HttpResponse Http(const HttpRequest& rq) {
+// One WinHTTP session for the whole process: WinHTTP keeps a session's connections alive and reuses them, so a run of
+// small requests to a node pays one TLS handshake per connection instead of one per file (and the sync workers share it).
+inline HINTERNET HttpSession() {
+  static HINTERNET s = [] {
+    HINTERNET h = WinHttpOpen(L"ChronoDrive/1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (h) { DWORD n = 32; WinHttpSetOption(h, WINHTTP_OPTION_MAX_CONNS_PER_SERVER, &n, sizeof n); }
+    return h;
+  }();
+  return s;
+}
+inline HttpResponse HttpOnce(const HttpRequest& rq) {
   HttpResponse r; std::wstring wurl = Wide(rq.url);
   URL_COMPONENTS uc{}; uc.dwStructSize = sizeof uc; wchar_t host[256], path[4096]; uc.lpszHostName = host; uc.dwHostNameLength = 256; uc.lpszUrlPath = path; uc.dwUrlPathLength = 4096;
   if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) { r.error = "bad url"; return r; }
-  HINTERNET s = WinHttpOpen(L"ChronoDrive/1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+  HINTERNET s = HttpSession();
   if (!s) { r.error = "WinHttpOpen"; return r; }
-  WinHttpSetTimeouts(s, rq.timeoutMs, rq.timeoutMs, rq.timeoutMs, rq.timeoutMs);
   HINTERNET c = WinHttpConnect(s, host, uc.nPort, 0);
   bool https = uc.nScheme == INTERNET_SCHEME_HTTPS;
   HINTERNET q = c ? WinHttpOpenRequest(c, rq.method.c_str(), path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, https ? WINHTTP_FLAG_SECURE : 0) : nullptr;
-  if (!q) { r.error = "connect: " + LastErrorText(); if (c) WinHttpCloseHandle(c); WinHttpCloseHandle(s); return r; }
+  if (!q) { r.winerr = GetLastError(); r.error = "connect: " + LastErrorText(r.winerr); if (c) WinHttpCloseHandle(c); return r; }
+  WinHttpSetTimeouts(q, rq.timeoutMs, rq.timeoutMs, rq.timeoutMs, rq.timeoutMs);
   PinCtx pin; pin.want = rq.pinSha256;
   if (https && !rq.pinSha256.empty()) {
     // a home node's self-signed certificate: ignore the CA chain and the name, then check the pin before the body goes
@@ -231,7 +246,7 @@ inline HttpResponse Http(const HttpRequest& rq) {
   if (hdr.empty()) hdr = L"Accept: application/json\r\n";
   uint64_t total = rq.bodyFile.empty() ? rq.body.size() : rq.bodyLength;
   BOOL ok = WinHttpSendRequest(q, hdr.c_str(), (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, (DWORD)total, https && !rq.pinSha256.empty() ? (DWORD_PTR)&pin : 0);
-  if (ok && pin.failed) { r.error = "certificate pin mismatch (the node's certificate is not the one the server handed out)"; r.status = 0; WinHttpCloseHandle(q); WinHttpCloseHandle(c); WinHttpCloseHandle(s); return r; }
+  if (ok && pin.failed) { r.error = "certificate pin mismatch (the node's certificate is not the one the server handed out)"; r.status = 0; WinHttpCloseHandle(q); WinHttpCloseHandle(c); return r; }
   if (ok && total) {
     if (rq.bodyFile.empty()) { DWORD wr = 0; ok = WinHttpWriteData(q, rq.body.data(), (DWORD)rq.body.size(), &wr); }
     else {
@@ -246,7 +261,7 @@ inline HttpResponse Http(const HttpRequest& rq) {
     }
   }
   if (ok) ok = WinHttpReceiveResponse(q, nullptr);
-  if (!ok) r.error = "request: " + LastErrorText();
+  if (!ok) { r.winerr = GetLastError(); r.error = "request: " + LastErrorText(r.winerr); }
   else {
     DWORD st = 0, sz = sizeof st; WinHttpQueryHeaders(q, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &st, &sz, WINHTTP_NO_HEADER_INDEX); r.status = (int)st;
     DWORD hl = 0; WinHttpQueryHeaders(q, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &hl, WINHTTP_NO_HEADER_INDEX);
@@ -267,7 +282,15 @@ inline HttpResponse Http(const HttpRequest& rq) {
     }
     if (out != INVALID_HANDLE_VALUE) { FlushFileBuffers(out); CloseHandle(out); }
   }
-  WinHttpCloseHandle(q); WinHttpCloseHandle(c); WinHttpCloseHandle(s);
+  WinHttpCloseHandle(q); WinHttpCloseHandle(c);
+  return r;
+}
+// A kept-alive connection the node closed meanwhile fails as "connection error": once more on a fresh one. Repeating a
+// write is safe here: the drive answers a repeated PUT/commit with 412 (same content, adopted by the engine) and a
+// repeated DELETE with 404.
+inline HttpResponse Http(const HttpRequest& rq) {
+  HttpResponse r = HttpOnce(rq);
+  if (r.status == 0 && r.winerr == ERROR_WINHTTP_CONNECTION_ERROR) r = HttpOnce(rq);
   return r;
 }
 inline HttpResponse HttpJson(const std::wstring& method, const std::string& url, const json& body = nullptr, const std::vector<std::wstring>& extra = {}, int timeoutMs = 20000, const std::string& pin = "") {

@@ -147,7 +147,7 @@ int wmain(int argc, wchar_t** argv) {
       Sleep(2000);
       for (auto& m : cfg.maps) {
         auto st = set.Status(m.id);
-        std::string line = st.state + "  " + st.detail + (st.readOnly ? "  [read only" + (st.localOnly ? ", " + std::to_string(st.localOnly) + " local changes not sent" : std::string()) + "]" : "") + (st.pending ? "  pending " + std::to_string(st.pending) : "") + (st.bytesTotal ? "  " + Human(st.bytesDone) + "/" + Human(st.bytesTotal) : "") + (st.nodeUrl.empty() ? "" : "  @ " + st.nodeUrl);
+        std::string line = st.state + "  " + st.detail + (st.readOnly ? "  [read only" + (st.localOnly ? ", " + std::to_string(st.localOnly) + " local changes not sent" : std::string()) + "]" : "") + (st.state == "syncing" && !st.phase.empty() ? "  " + ProgressText(st) : "") + (st.nodeUrl.empty() ? "" : "  @ " + st.nodeUrl);
         if (line != last[m.id]) { out(TimeLocal(Now()) + "  " + (cfg.maps.size() > 1 ? "[" + m.name + "] " : "") + line); last[m.id] = line; }
         if (st.state == "error") err = true;
       }

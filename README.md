@@ -56,6 +56,10 @@ protocol and sync rules, so Linux and Windows PCs share a drive. Install from a 
   revision (`rev`). A **remote pass** reads the drive's change feed since that revision (long polls keep it near
   real time); a **local pass** compares the folder with the index (a watcher on the folder plus a full scan every
   10 minutes). Files up to 8 MiB go in one PUT; bigger ones in 8 MiB chunks, resumed after a cut.
+- Several files move at once (6 per drive; `"workers": N` in `config.json`, 1 to 16, or `CHRONODRIVE_WORKERS`), over
+  kept-alive connections: a first sync of a folder with many small files is many times faster than one file at a time.
+  Deletes still go first and one by one, folders before their files. The card (and the hub) show the files left, the
+  bytes and the files per second.
 - Rules: a remote change over an untouched local file wins; a local change over an untouched remote file wins;
   both changed = the drive's version keeps the name and the local one is kept as
   `name (conflict <PC> <date>).ext` and uploaded too. A file deleted elsewhere goes to this PC's Recycle Bin; a file

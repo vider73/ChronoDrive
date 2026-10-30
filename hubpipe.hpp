@@ -2,7 +2,9 @@
 // its own tray icon and the hub shows the drives. The hub reads them on a local pipe, \\.\pipe\ChronoDrive.<session>,
 // open to this user only. Same shape as ChronoBackup's pipe: one JSON line in; one line out,
 // {"final":true,"ok":true,"result":{...}} or {"final":true,"ok":false,"error":"..."}.
-//   {"cmd":"status"}            -> {version, paired, email, overall, drives:[{id, name, at, state, detail, pending, paused}]}
+//   {"cmd":"status"}            -> {version, paired, email, overall, drives:[{id, name, at, state, detail, pending, paused,
+//                                   phase, bytes_done, bytes_total, rate, progress}]}   (pending = files left; progress =
+//                                   "Uploading, 1,234 files left (40.2 MB of 2.10 GB), 25 files/s" while syncing, else "")
 //   {"cmd":"pause","on":bool}   pause or resume every drive on this PC
 //   {"cmd":"sync"}              look at the server now
 //   {"cmd":"show"}              bring the window up
